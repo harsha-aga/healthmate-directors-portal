@@ -26,6 +26,10 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
+To use Firebase Firestore instead of SQLite, set `HEALTHMATE_STORE=firebase` and point
+`GOOGLE_APPLICATION_CREDENTIALS` or `FIREBASE_SERVICE_ACCOUNT_FILE` at a Firebase service
+account JSON file before starting the backend.
+
 ### Frontend
 
 ```bash

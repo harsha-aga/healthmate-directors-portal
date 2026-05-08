@@ -1,17 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
+import { signInWithEmailAndPassword, signOut } from "firebase/auth";
+
+import { auth, isFirebaseAuthConfigured } from "./firebase";
+import { IoSettingsSharp } from "react-icons/io5";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
-
-const DEMO_CREDENTIALS = {
-  director: {
-    email: "director@healthmate.app",
-    password: "password123"
-  },
-  resident: {
-    email: "margaret@healthmate.app",
-    password: "password123"
-  }
-};
 
 const EXPERIENCE_COPY = {
   director: {
@@ -50,12 +43,37 @@ const longDateFormatter = new Intl.DateTimeFormat("en-US", {
   year: "numeric"
 });
 
+const noteDateFormatter = new Intl.DateTimeFormat("en-US", {
+  month: "long",
+  day: "numeric",
+  year: "numeric",
+  hour: "numeric",
+  minute: "2-digit"
+});
+
 function toDateInputValue(date) {
   return date.toISOString().split("T")[0];
 }
 
 function formatLongDate(dateString) {
   return longDateFormatter.format(new Date(`${dateString}T00:00:00`));
+}
+
+function formatNoteDate(value) {
+  if (!value) {
+    return "";
+  }
+  const raw = String(value).trim();
+  if (!raw) {
+    return "";
+  }
+
+  const normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) {
+    return raw;
+  }
+  return noteDateFormatter.format(parsed);
 }
 
 function buildMonthGrid(referenceDate) {
@@ -109,10 +127,9 @@ function LandingScreen({ onChooseMode, onCreateUser }) {
       <section className="landing-card">
         <div className="landing-copy">
           <p className="eyebrow">HealthMate</p>
-          <h1>Pick the right entrance for the person using the app.</h1>
+          <h1>Director Workspace</h1>
           <p className="lede">
-            Directors and residents now have separate sign-in experiences so the interface
-            feels more tailored from the first screen onward.
+            Sign in to manage the community schedule, residents, and one-on-one check-ins.
           </p>
         </div>
 
@@ -121,12 +138,6 @@ function LandingScreen({ onChooseMode, onCreateUser }) {
             <span className="portal-label">Director Login</span>
             <strong>Manage the community schedule</strong>
             <p>Create events, review attendance, and add residents.</p>
-          </button>
-
-          <button type="button" className="portal-card portal-card--resident" onClick={() => onChooseMode("resident-login")}>
-            <span className="portal-label">Resident Login</span>
-            <strong>Browse and join activities</strong>
-            <p>See what is happening each day and select multiple events to attend.</p>
           </button>
 
           <button type="button" className="secondary-button secondary-button--wide" onClick={onCreateUser}>
@@ -139,7 +150,7 @@ function LandingScreen({ onChooseMode, onCreateUser }) {
 }
 
 function LoginScreen({ role, onLogin, onBack, onGoToCreateUser, loading, error }) {
-  const [form, setForm] = useState(DEMO_CREDENTIALS[role]);
+  const [form, setForm] = useState({ email: "", password: "" });
   const copy = EXPERIENCE_COPY[role];
 
   const handleSubmit = async (event) => {
@@ -191,9 +202,6 @@ function LoginScreen({ role, onLogin, onBack, onGoToCreateUser, loading, error }
           </button>
 
           <div className="auth-actions">
-            <button type="button" className="secondary-button" onClick={() => setForm(DEMO_CREDENTIALS[role])}>
-              Use Demo Login
-            </button>
             <button type="button" className="secondary-button" onClick={onGoToCreateUser}>
               Create User
             </button>
@@ -530,7 +538,7 @@ function DayPanel({ user, selectedDate, events, onCreateEvent, onToggleAttendanc
   );
 }
 
-function ManageUsersPanel({ users, loading }) {
+function ManageUsersPanel({ users, loading, onOpenResidentNotes }) {
   const directors = users.filter((entry) => entry.role === "director");
   const residents = users.filter((entry) => entry.role === "resident");
 
@@ -561,14 +569,484 @@ function ManageUsersPanel({ users, loading }) {
           <h3>Residents</h3>
           <ul className="user-list">
             {residents.map((entry) => (
-              <li key={entry.id} className="user-row">
-                <strong>{entry.full_name}</strong>
-                <span>{entry.email}</span>
+              <li key={entry.id}>
+                <button
+                  type="button"
+                  className="user-row user-row--clickable"
+                  onClick={() => onOpenResidentNotes?.(entry)}
+                  aria-label={`Open notes for ${entry.full_name}`}
+                  title="Open resident notes"
+                >
+                  <strong>{entry.full_name}</strong>
+                  <span>{entry.email}</span>
+                </button>
               </li>
             ))}
           </ul>
         </section>
       </div>
+    </div>
+  );
+}
+
+function ResidentNotesModal({ resident, notes, loading, error, onClose, onSaveNote }) {
+  const [draft, setDraft] = useState("");
+  const maxNoteLength = 10000;
+
+  useEffect(() => {
+    setDraft("");
+  }, [resident?.id]);
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  if (!resident) {
+    return null;
+  }
+
+  return (
+    <div className="modal-overlay" role="dialog" aria-modal="true" aria-label="Resident notes">
+      <div className="modal-surface">
+        <div className="modal-header">
+          <div>
+            <p className="eyebrow">Resident Notes</p>
+            <h2>{resident.full_name}</h2>
+            <p className="muted-copy">{resident.email}</p>
+          </div>
+
+          <button type="button" className="icon-button modal-close" onClick={onClose} aria-label="Close" title="Close">
+            <span aria-hidden="true">×</span>
+          </button>
+        </div>
+
+        <form
+          className="stack-form"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            if (!draft.trim()) {
+              return;
+            }
+            const saved = await onSaveNote({ resident_id: resident.id, note: draft.trim() });
+            if (saved) {
+              setDraft("");
+            }
+          }}
+        >
+          <label>
+            New Note
+            <textarea
+              rows={4}
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder="Add a private note about this resident."
+              maxLength={maxNoteLength}
+            />
+          </label>
+          <p className="muted-copy muted-copy--right">
+            {draft.length.toLocaleString()} / {maxNoteLength.toLocaleString()}
+          </p>
+          <div className="modal-actions">
+            <button type="submit" className="primary-button" disabled={loading || !draft.trim()}>
+              {loading ? "Saving..." : "Save Note"}
+            </button>
+            <button type="button" className="secondary-button" onClick={onClose}>
+              Done
+            </button>
+          </div>
+        </form>
+
+        {error ? <p className="error-banner">{error}</p> : null}
+        {loading ? <p className="muted-copy">Loading notes...</p> : null}
+
+        {!loading && notes.length === 0 ? (
+          <div className="empty-state">
+            <h3>No notes yet</h3>
+            <p>Start with a quick note above and you will see the history here.</p>
+          </div>
+        ) : null}
+
+        {notes.length > 0 ? (
+          <div className="event-list modal-notes-list">
+            {notes.map((entry) => (
+              <article key={entry.id} className="event-card">
+                <div className="event-body">
+                  <div className="event-time">
+                    <strong>Note</strong>
+                    <span className="muted-copy">{formatNoteDate(entry.created_at)}</span>
+                  </div>
+                  <p className="event-description">{entry.note}</p>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : null}
+      </div>
+      <button type="button" className="modal-backdrop" onClick={onClose} aria-label="Close modal" />
+    </div>
+  );
+}
+
+function CheckInsPanel({
+  residents,
+  checkins,
+  loading,
+  error,
+  onCreateCheckIn,
+  onUpdateCheckIn,
+  onDeleteCheckIn,
+  notes,
+  notesLoading,
+  notesError,
+  selectedResidentId,
+  onSelectResidentForNotes,
+  onCreateResidentNote
+}) {
+  const [tab, setTab] = useState("upcoming");
+  const [form, setForm] = useState({
+    resident_id: residents[0]?.id || "",
+    scheduled_date: toDateInputValue(new Date()),
+    scheduled_time: "10:00",
+    notes: ""
+  });
+  const [noteDraft, setNoteDraft] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    setForm((current) => ({
+      ...current,
+      resident_id: residents[0]?.id || ""
+    }));
+  }, [residents]);
+
+  const todayString = useMemo(() => toDateInputValue(new Date()), []);
+
+  const upcoming = useMemo(() => {
+    return checkins.filter(
+      (entry) => entry.status === "scheduled" && String(entry.scheduled_date) >= todayString
+    );
+  }, [checkins, todayString]);
+
+  const previous = useMemo(() => {
+    return checkins
+      .filter((entry) => entry.status !== "scheduled" || String(entry.scheduled_date) < todayString)
+      .sort((a, b) => {
+        const dateCompare = String(b.scheduled_date).localeCompare(String(a.scheduled_date));
+        if (dateCompare !== 0) return dateCompare;
+        return String(b.scheduled_time).localeCompare(String(a.scheduled_time));
+      });
+  }, [checkins, todayString]);
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    setSubmitting(true);
+    try {
+      const created = await onCreateCheckIn({
+        resident_id: Number(form.resident_id),
+        scheduled_date: form.scheduled_date,
+        scheduled_time: form.scheduled_time,
+        notes: form.notes
+      });
+      if (created) {
+        setForm((current) => ({
+          ...current,
+          scheduled_time: current.scheduled_time,
+          notes: ""
+        }));
+        setTab("upcoming");
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="drawer-stack">
+      <div className="drawer-header">
+        <p className="eyebrow">1:1 Check-ins</p>
+        <h2>Schedule resident check-ins</h2>
+        <p className="lede">Plan one-on-one time with residents and track follow-ups.</p>
+      </div>
+
+      <div className="drawer-tabs">
+        <button
+          type="button"
+          className={`drawer-tab ${tab === "upcoming" ? "drawer-tab--active" : ""}`}
+          onClick={() => setTab("upcoming")}
+        >
+          Upcoming
+        </button>
+        <button
+          type="button"
+          className={`drawer-tab ${tab === "previous" ? "drawer-tab--active" : ""}`}
+          onClick={() => setTab("previous")}
+        >
+          Previous
+        </button>
+        <button
+          type="button"
+          className={`drawer-tab ${tab === "schedule" ? "drawer-tab--active" : ""}`}
+          onClick={() => setTab("schedule")}
+        >
+          Schedule
+        </button>
+        <button
+          type="button"
+          className={`drawer-tab ${tab === "notes" ? "drawer-tab--active" : ""}`}
+          onClick={() => {
+            setTab("notes");
+            const nextResidentId = selectedResidentId || residents[0]?.id || "";
+            if (nextResidentId) {
+              onSelectResidentForNotes(Number(nextResidentId));
+            }
+          }}
+        >
+          Resident Notes
+        </button>
+      </div>
+
+      {error ? <p className="error-banner">{error}</p> : null}
+      {loading ? <p className="muted-copy">Loading check-ins...</p> : null}
+
+      {tab === "upcoming" ? (
+        <div className="drawer-section">
+          {upcoming.length === 0 ? (
+            <div className="empty-state">
+              <h3>No check-ins scheduled yet</h3>
+              <p>Use the Schedule tab to plan your first one-on-one.</p>
+            </div>
+          ) : (
+            <div className="event-list">
+              {upcoming.map((entry) => (
+                <article key={entry.id} className="event-card">
+                  <div className="event-body">
+                    <div className="event-time">
+                      <strong>
+                        {entry.scheduled_date} at {entry.scheduled_time}
+                      </strong>
+                      <span className="muted-copy">{entry.resident.full_name}</span>
+                    </div>
+                    {entry.notes ? <p className="event-description">{entry.notes}</p> : null}
+                  </div>
+                  <div className="event-footer">
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => onUpdateCheckIn(entry, { status: "completed" })}
+                    >
+                      Mark Completed
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => onUpdateCheckIn(entry, { status: "canceled" })}
+                    >
+                      Cancel
+                    </button>
+                    <button type="button" className="text-button" onClick={() => onDeleteCheckIn(entry)}>
+                      Delete
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : tab === "previous" ? (
+        <div className="drawer-section">
+          {previous.length === 0 ? (
+            <div className="empty-state">
+              <h3>No previous check-ins yet</h3>
+              <p>Completed and canceled check-ins will show up here.</p>
+            </div>
+          ) : (
+            <div className="event-list">
+              {previous.map((entry) => (
+                <article key={entry.id} className="event-card">
+                  <div className="event-body">
+                    <div className="event-time">
+                      <strong>
+                        {entry.scheduled_date} at {entry.scheduled_time}
+                      </strong>
+                      <span className="muted-copy">
+                        {entry.resident.full_name} · {entry.status}
+                      </span>
+                    </div>
+                    {entry.notes ? <p className="event-description">{entry.notes}</p> : null}
+                  </div>
+                  <div className="event-footer">
+                    {entry.status !== "scheduled" ? null : (
+                      <>
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() => onUpdateCheckIn(entry, { status: "completed" })}
+                        >
+                          Mark Completed
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() => onUpdateCheckIn(entry, { status: "canceled" })}
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    )}
+                    <button type="button" className="text-button" onClick={() => onDeleteCheckIn(entry)}>
+                      Delete
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : tab === "notes" ? (
+        <div className="drawer-section">
+          {residents.length === 0 ? (
+            <div className="empty-state">
+              <h3>No residents yet</h3>
+              <p>Create residents first so you can store personal notes.</p>
+            </div>
+          ) : (
+            <div className="drawer-stack">
+              <label>
+                Resident
+                <select
+                  value={selectedResidentId || residents[0]?.id || ""}
+                  onChange={(event) => onSelectResidentForNotes(Number(event.target.value))}
+                >
+                  {residents.map((resident) => (
+                    <option key={resident.id} value={resident.id}>
+                      {resident.full_name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <form
+                className="stack-form"
+                onSubmit={async (event) => {
+                  event.preventDefault();
+                  const residentId = Number(selectedResidentId || residents[0]?.id || 0);
+                  if (!residentId || !noteDraft.trim()) {
+                    return;
+                  }
+                  const created = await onCreateResidentNote({ resident_id: residentId, note: noteDraft.trim() });
+                  if (created) {
+                    setNoteDraft("");
+                  }
+                }}
+              >
+                <label>
+                  New Note
+                  <textarea
+                    rows={4}
+                    value={noteDraft}
+                    onChange={(event) => setNoteDraft(event.target.value)}
+                    placeholder="Add a private note about this resident."
+                  />
+                </label>
+                <button type="submit" className="primary-button" disabled={notesLoading || !noteDraft.trim()}>
+                  {notesLoading ? "Saving..." : "Save Note"}
+                </button>
+              </form>
+
+              {notesError ? <p className="error-banner">{notesError}</p> : null}
+              {notesLoading ? <p className="muted-copy">Loading notes...</p> : null}
+
+              {!notesLoading && notes.length === 0 ? (
+                <div className="empty-state">
+                  <h3>No notes yet for this resident</h3>
+                  <p>Add the first note above to start keeping a private record.</p>
+                </div>
+              ) : null}
+
+              {notes.length > 0 ? (
+                <div className="event-list">
+                  {notes.map((entry) => (
+                    <article key={entry.id} className="event-card">
+                      <div className="event-body">
+                        <div className="event-time">
+                          <strong>Note</strong>
+                          <span className="muted-copy">{entry.created_at || ""}</span>
+                        </div>
+                        <p className="event-description">{entry.note}</p>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="drawer-section">
+          {residents.length === 0 ? (
+            <div className="empty-state">
+              <h3>No residents yet</h3>
+              <p>Create residents first so you can schedule check-ins.</p>
+            </div>
+          ) : (
+            <form className="stack-form" onSubmit={handleSubmit}>
+              <label>
+                Resident
+                <select
+                  value={form.resident_id}
+                  onChange={(event) => setForm((current) => ({ ...current, resident_id: event.target.value }))}
+                >
+                  {residents.map((resident) => (
+                    <option key={resident.id} value={resident.id}>
+                      {resident.full_name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Date
+                <input
+                  type="date"
+                  value={form.scheduled_date}
+                  onChange={(event) => setForm((current) => ({ ...current, scheduled_date: event.target.value }))}
+                  required
+                />
+              </label>
+
+              <label>
+                Time
+                <input
+                  type="time"
+                  value={form.scheduled_time}
+                  onChange={(event) => setForm((current) => ({ ...current, scheduled_time: event.target.value }))}
+                  required
+                />
+              </label>
+
+              <label>
+                Notes
+                <textarea
+                  rows={3}
+                  value={form.notes}
+                  onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))}
+                  placeholder="Optional notes for the check-in."
+                />
+              </label>
+
+              <button type="submit" className="primary-button" disabled={submitting}>
+                {submitting ? "Scheduling..." : "Schedule Check-in"}
+              </button>
+            </form>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -600,13 +1078,34 @@ function SettingsPanel({ user }) {
   );
 }
 
-function CalendarGrid({ currentMonth, selectedDate, events, onSelectDate }) {
+function CalendarGrid({ currentMonth, selectedDate, events, onSelectDate, onPreviousMonth, onNextMonth }) {
   const today = new Date();
   const days = buildMonthGrid(currentMonth);
   const selected = new Date(`${selectedDate}T00:00:00`);
 
   return (
     <section className="calendar-board">
+      <div className="calendar-nav calendar-nav--top">
+        <button
+          type="button"
+          className="icon-button"
+          onClick={onPreviousMonth}
+          aria-label="Previous month"
+          title="Previous month"
+        >
+          <span aria-hidden="true">‹</span>
+        </button>
+        <button
+          type="button"
+          className="icon-button"
+          onClick={onNextMonth}
+          aria-label="Next month"
+          title="Next month"
+        >
+          <span aria-hidden="true">›</span>
+        </button>
+      </div>
+
       <div className="calendar-board__header">
         <div>
           <h2>{monthFormatter.format(currentMonth)}</h2>
@@ -655,6 +1154,27 @@ function CalendarGrid({ currentMonth, selectedDate, events, onSelectDate }) {
           );
         })}
       </div>
+
+      <div className="calendar-nav calendar-nav--bottom">
+        <button
+          type="button"
+          className="icon-button"
+          onClick={onPreviousMonth}
+          aria-label="Previous month"
+          title="Previous month"
+        >
+          <span aria-hidden="true">‹</span>
+        </button>
+        <button
+          type="button"
+          className="icon-button"
+          onClick={onNextMonth}
+          aria-label="Next month"
+          title="Next month"
+        >
+          <span aria-hidden="true">›</span>
+        </button>
+      </div>
     </section>
   );
 }
@@ -664,6 +1184,15 @@ function Dashboard({
   events,
   users,
   usersLoading,
+  checkins,
+  checkinsLoading,
+  checkinsError,
+  notes,
+  notesLoading,
+  notesError,
+  selectedResidentId,
+  residentNotesModalOpen,
+  residentNotesModalResident,
   createUserError,
   createUserSuccess,
   onLogout,
@@ -673,6 +1202,13 @@ function Dashboard({
   onCreateEvent,
   onCreateUser,
   onToggleAttendance,
+  onCreateCheckIn,
+  onUpdateCheckIn,
+  onDeleteCheckIn,
+  onSelectResidentForNotes,
+  onCreateResidentNote,
+  onOpenResidentNotesModal,
+  onCloseResidentNotesModal,
   createLoading,
   userCreateLoading,
   attendanceLoading,
@@ -708,21 +1244,36 @@ function Dashboard({
         </div>
 
         <div className="topbar-actions topbar-actions--stacked">
-          <div className="month-controls">
-            <button type="button" className="secondary-button" onClick={previousMonth}>
-              Previous
+          <div className="topbar-utility">
+            <button
+              type="button"
+              className="secondary-button secondary-button--compact icon-button"
+              onClick={() => {
+                onOpenSettings();
+                setDrawerView("settings");
+              }}
+              aria-label="Settings"
+              title="Settings"
+            >
+              <IoSettingsSharp aria-hidden="true" focusable="false" />
             </button>
-            <button type="button" className="secondary-button" onClick={nextMonth}>
-              Next
+            <button
+              type="button"
+              className="secondary-button secondary-button--compact"
+              onClick={onLogout}
+            >
+              Log Out
             </button>
           </div>
-
           <nav className="navbar-actions">
             <button type="button" className="secondary-button" onClick={() => setDrawerView("day")}>
               Day View
             </button>
             {user.role === "director" ? (
               <>
+                <button type="button" className="secondary-button" onClick={() => setDrawerView("checkins")}>
+                  1:1 Check-ins
+                </button>
                 <button type="button" className="secondary-button" onClick={() => {
                   onOpenManageUsers();
                   setDrawerView("manage-users");
@@ -737,15 +1288,6 @@ function Dashboard({
                 </button>
               </>
             ) : null}
-            <button type="button" className="secondary-button" onClick={() => {
-              onOpenSettings();
-              setDrawerView("settings");
-            }}>
-              Settings
-            </button>
-            <button type="button" className="secondary-button" onClick={onLogout}>
-              Log Out
-            </button>
           </nav>
         </div>
       </header>
@@ -758,6 +1300,8 @@ function Dashboard({
           selectedDate={selectedDate}
           events={events}
           onSelectDate={openDayDrawer}
+          onPreviousMonth={previousMonth}
+          onNextMonth={nextMonth}
         />
 
         <aside className="side-drawer">
@@ -774,7 +1318,25 @@ function Dashboard({
           ) : null}
 
           {drawerView === "manage-users" && user.role === "director" ? (
-            <ManageUsersPanel users={users} loading={usersLoading} />
+            <ManageUsersPanel users={users} loading={usersLoading} onOpenResidentNotes={onOpenResidentNotesModal} />
+          ) : null}
+
+          {drawerView === "checkins" && user.role === "director" ? (
+            <CheckInsPanel
+              residents={users.filter((entry) => entry.role === "resident")}
+              checkins={checkins}
+              loading={checkinsLoading}
+              error={checkinsError}
+              onCreateCheckIn={onCreateCheckIn}
+              onUpdateCheckIn={onUpdateCheckIn}
+              onDeleteCheckIn={onDeleteCheckIn}
+              notes={notes}
+              notesLoading={notesLoading}
+              notesError={notesError}
+              selectedResidentId={selectedResidentId}
+              onSelectResidentForNotes={onSelectResidentForNotes}
+              onCreateResidentNote={onCreateResidentNote}
+            />
           ) : null}
 
           {drawerView === "create-user" && user.role === "director" ? (
@@ -798,6 +1360,17 @@ function Dashboard({
           {drawerView === "settings" ? <SettingsPanel user={user} /> : null}
         </aside>
       </main>
+
+      {residentNotesModalOpen ? (
+        <ResidentNotesModal
+          resident={residentNotesModalResident}
+          notes={notes}
+          loading={notesLoading}
+          error={notesError}
+          onClose={onCloseResidentNotesModal}
+          onSaveNote={onCreateResidentNote}
+        />
+      ) : null}
     </div>
   );
 }
@@ -807,6 +1380,15 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [events, setEvents] = useState([]);
   const [users, setUsers] = useState([]);
+  const [checkins, setCheckins] = useState([]);
+  const [checkinsLoading, setCheckinsLoading] = useState(false);
+  const [checkinsError, setCheckinsError] = useState("");
+  const [selectedResidentId, setSelectedResidentId] = useState(null);
+  const [notes, setNotes] = useState([]);
+  const [notesLoading, setNotesLoading] = useState(false);
+  const [notesError, setNotesError] = useState("");
+  const [residentNotesModalOpen, setResidentNotesModalOpen] = useState(false);
+  const [residentNotesModalResident, setResidentNotesModalResident] = useState(null);
   const [usersLoading, setUsersLoading] = useState(false);
   const [authLoading, setAuthLoading] = useState(false);
   const [createLoading, setCreateLoading] = useState(false);
@@ -817,6 +1399,13 @@ export default function App() {
   const [createUserError, setCreateUserError] = useState("");
   const [createUserSuccess, setCreateUserSuccess] = useState("");
 
+  useEffect(() => {
+    // This app doesn't use URL routing; normalize any stray paths (like `/1`) back to `/`.
+    if (typeof window !== "undefined" && window.location?.pathname && window.location.pathname !== "/") {
+      window.history.replaceState({}, "", "/");
+    }
+  }, []);
+
   const fetchEvents = async (currentUser) => {
     const data = await apiRequest(`/events?viewer_id=${currentUser.id}`);
     setEvents(data);
@@ -825,11 +1414,67 @@ export default function App() {
   const fetchUsers = async () => {
     setUsersLoading(true);
     try {
-      const data = await apiRequest("/users");
+      if (!user) {
+        setUsers([]);
+        return;
+      }
+      const data = await apiRequest(`/users?director_id=${user.id}`);
       setUsers(data);
     } finally {
       setUsersLoading(false);
     }
+  };
+
+  const fetchCheckIns = async (currentUser) => {
+    if (!currentUser || currentUser.role !== "director") {
+      setCheckins([]);
+      return;
+    }
+
+    setCheckinsLoading(true);
+    setCheckinsError("");
+    try {
+      const data = await apiRequest(`/checkins?director_id=${currentUser.id}`);
+      setCheckins(data);
+    } catch (error) {
+      setCheckinsError(error.message);
+    } finally {
+      setCheckinsLoading(false);
+    }
+  };
+
+  const fetchResidentNotes = async (currentUser, residentId) => {
+    if (!currentUser || currentUser.role !== "director" || !residentId) {
+      setNotes([]);
+      return;
+    }
+
+    setNotesLoading(true);
+    setNotesError("");
+    try {
+      const data = await apiRequest(
+        `/resident-notes?resident_id=${residentId}&director_id=${currentUser.id}`
+      );
+      setNotes(data);
+    } catch (error) {
+      setNotesError(error.message);
+    } finally {
+      setNotesLoading(false);
+    }
+  };
+
+  const handleOpenResidentNotesModal = async (resident) => {
+    if (!resident) {
+      return;
+    }
+    setResidentNotesModalResident(resident);
+    setResidentNotesModalOpen(true);
+    setSelectedResidentId(resident.id);
+    await fetchResidentNotes(user, resident.id);
+  };
+
+  const handleCloseResidentNotesModal = () => {
+    setResidentNotesModalOpen(false);
   };
 
   const handleLogin = async (credentials, expectedRole) => {
@@ -837,10 +1482,40 @@ export default function App() {
     setAuthError("");
 
     try {
-      const currentUser = await apiRequest("/auth/login", {
-        method: "POST",
-        body: JSON.stringify(credentials)
-      });
+      let currentUser;
+
+      if (isFirebaseAuthConfigured) {
+        let firebaseSession;
+        try {
+          firebaseSession = await signInWithEmailAndPassword(
+            auth,
+            credentials.email,
+            credentials.password
+          );
+        } catch (error) {
+          const code = error?.code || "";
+          const message = error?.message || "";
+
+          if (code.includes("api-key-not-valid") || code.includes("invalid-api-key") || message.includes("api-key")) {
+            throw new Error(
+              "Firebase Auth is misconfigured (invalid API key). Update frontend/.env with the Web app config values from Firebase Console, then restart `npm run dev`."
+            );
+          }
+
+          throw error;
+        }
+        const idToken = await firebaseSession.user.getIdToken();
+
+        currentUser = await apiRequest("/auth/firebase-login", {
+          method: "POST",
+          body: JSON.stringify({ id_token: idToken })
+        });
+      } else {
+        currentUser = await apiRequest("/auth/login", {
+          method: "POST",
+          body: JSON.stringify(credentials)
+        });
+      }
 
       if (currentUser.role !== expectedRole) {
         throw new Error(
@@ -855,9 +1530,13 @@ export default function App() {
       await fetchEvents(currentUser);
       if (currentUser.role === "director") {
         await fetchUsers();
+        await fetchCheckIns(currentUser);
       }
     } catch (error) {
-      setAuthError(error.message);
+      if (isFirebaseAuthConfigured) {
+        await signOut(auth);
+      }
+      setAuthError(error?.message || "Sign in failed.");
     } finally {
       setAuthLoading(false);
     }
@@ -893,7 +1572,10 @@ export default function App() {
     setApiError("");
 
     try {
-      const createdUser = await apiRequest("/users", {
+      if (!user) {
+        throw new Error("Please sign in as a director first.");
+      }
+      const createdUser = await apiRequest(`/users?director_id=${user.id}`, {
         method: "POST",
         body: JSON.stringify(payload)
       });
@@ -901,6 +1583,7 @@ export default function App() {
       setCreateUserSuccess(successMessage);
       if (user?.role === "director") {
         await fetchUsers();
+        await fetchCheckIns(user);
       }
       return true;
     } catch (error) {
@@ -913,6 +1596,94 @@ export default function App() {
       return false;
     } finally {
       setUserCreateLoading(false);
+    }
+  };
+
+  const handleCreateCheckIn = async (payload) => {
+    if (!user || user.role !== "director") {
+      return false;
+    }
+
+    setApiError("");
+    setCheckinsError("");
+    try {
+      await apiRequest(`/checkins?director_id=${user.id}`, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      await fetchCheckIns(user);
+      return true;
+    } catch (error) {
+      setCheckinsError(error.message);
+      setApiError(error.message);
+      return false;
+    }
+  };
+
+  const handleSelectResidentForNotes = async (residentId) => {
+    setSelectedResidentId(residentId);
+    setNotes([]);
+    setNotesError("");
+    if (residentId && user?.role === "director") {
+      await fetchResidentNotes(user, residentId);
+    }
+  };
+
+  const handleCreateResidentNote = async (payload) => {
+    if (!user || user.role !== "director") {
+      return false;
+    }
+
+    setApiError("");
+    setNotesError("");
+    try {
+      await apiRequest(`/resident-notes?director_id=${user.id}`, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      await fetchResidentNotes(user, payload.resident_id);
+      return true;
+    } catch (error) {
+      setNotesError(error.message);
+      setApiError(error.message);
+      return false;
+    }
+  };
+
+  const handleUpdateCheckIn = async (entry, patch) => {
+    if (!user || user.role !== "director") {
+      return;
+    }
+
+    setApiError("");
+    setCheckinsError("");
+    try {
+      await apiRequest(`/checkins/${entry.id}?director_id=${user.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: patch.status })
+      });
+      await fetchCheckIns(user);
+    } catch (error) {
+      setCheckinsError(error.message);
+      setApiError(error.message);
+    }
+  };
+
+  const handleDeleteCheckIn = async (entry) => {
+    if (!user || user.role !== "director") {
+      return;
+    }
+
+    setApiError("");
+    setCheckinsError("");
+    try {
+      await apiRequest(`/checkins/${entry.id}?director_id=${user.id}`, {
+        method: "DELETE"
+      });
+      await fetchCheckIns(user);
+    } catch (error) {
+      setCheckinsError(error.message);
+      setApiError(error.message);
     }
   };
 
@@ -937,10 +1708,22 @@ export default function App() {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    if (isFirebaseAuthConfigured) {
+      await signOut(auth);
+    }
     setUser(null);
     setEvents([]);
     setUsers([]);
+    setCheckins([]);
+    setCheckinsLoading(false);
+    setCheckinsError("");
+    setSelectedResidentId(null);
+    setNotes([]);
+    setNotesLoading(false);
+    setNotesError("");
+    setResidentNotesModalOpen(false);
+    setResidentNotesModalResident(null);
     setAuthError("");
     setApiError("");
     setCreateUserError("");
@@ -969,22 +1752,9 @@ export default function App() {
     }
 
     if (screen === "resident-login") {
-      return (
-        <LoginScreen
-          role="resident"
-          onLogin={handleLogin}
-          onBack={() => {
-            setAuthError("");
-            setScreen("landing");
-          }}
-          onGoToCreateUser={() => {
-            setAuthError("");
-            setScreen("create-user");
-          }}
-          loading={authLoading}
-          error={authError}
-        />
-      );
+      // Web portal is director-only; residents use the mobile app.
+      setScreen("landing");
+      return null;
     }
 
     if (screen === "create-user") {
@@ -1028,6 +1798,15 @@ export default function App() {
       events={events}
       users={users}
       usersLoading={usersLoading}
+      checkins={checkins}
+      checkinsLoading={checkinsLoading}
+      checkinsError={checkinsError}
+      notes={notes}
+      notesLoading={notesLoading}
+      notesError={notesError}
+      selectedResidentId={selectedResidentId}
+      residentNotesModalOpen={residentNotesModalOpen}
+      residentNotesModalResident={residentNotesModalResident}
       createUserError={createUserError}
       createUserSuccess={createUserSuccess}
       onLogout={handleLogout}
@@ -1040,6 +1819,13 @@ export default function App() {
       onCreateEvent={handleCreateEvent}
       onCreateUser={handleCreateUser}
       onToggleAttendance={handleToggleAttendance}
+      onCreateCheckIn={handleCreateCheckIn}
+      onUpdateCheckIn={handleUpdateCheckIn}
+      onDeleteCheckIn={handleDeleteCheckIn}
+      onSelectResidentForNotes={handleSelectResidentForNotes}
+      onCreateResidentNote={handleCreateResidentNote}
+      onOpenResidentNotesModal={handleOpenResidentNotesModal}
+      onCloseResidentNotesModal={handleCloseResidentNotesModal}
       createLoading={createLoading}
       userCreateLoading={userCreateLoading}
       attendanceLoading={attendanceLoading}
