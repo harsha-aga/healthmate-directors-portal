@@ -39,6 +39,10 @@ class UserCreateRequest(BaseModel):
     role: Literal["director", "resident"]
 
 
+class UserUpdateRequest(BaseModel):
+    full_name: str = Field(min_length=2, max_length=120)
+
+
 class EventCreateRequest(BaseModel):
     event_date: str
     event_time: str

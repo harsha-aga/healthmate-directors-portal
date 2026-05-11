@@ -47,8 +47,9 @@ const noteDateFormatter = new Intl.DateTimeFormat("en-US", {
   month: "long",
   day: "numeric",
   year: "numeric",
-  hour: "numeric",
-  minute: "2-digit"
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false
 });
 
 function toDateInputValue(date) {
@@ -68,9 +69,27 @@ function formatNoteDate(value) {
     return "";
   }
 
-  const normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
+  // Accept common server formats like:
+  // - 2026-05-08T19:25:08.808000+00:00
+  // - 2026-05-08 19:25:08.808000+00:00
+  let normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
+  // JS Date parsing is inconsistent with microseconds; keep at most milliseconds.
+  normalized = normalized.replace(/\.(\d{3})\d+/, ".$1");
+  // Some backends may emit a space before the timezone.
+  normalized = normalized.replace(/\s([+-]\d{2}:\d{2}|Z)$/, "$1");
+
   const parsed = new Date(normalized);
   if (Number.isNaN(parsed.getTime())) {
+    // Fallback: if it looks like "YYYY-MM-DD HH:MM:SS", format just the first 16 chars.
+    const compact = raw.replace("T", " ").replace(/\.\d+.*/, "");
+    const match = compact.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/);
+    if (match) {
+      const date = new Date(`${match[1]}T${match[2]}:00`);
+      if (!Number.isNaN(date.getTime())) {
+        return noteDateFormatter.format(date);
+      }
+      return `${match[1]} ${match[2]}`;
+    }
     return raw;
   }
   return noteDateFormatter.format(parsed);
@@ -976,7 +995,7 @@ function CheckInsPanel({
                       <div className="event-body">
                         <div className="event-time">
                           <strong>Note</strong>
-                          <span className="muted-copy">{entry.created_at || ""}</span>
+                          <span className="muted-copy">{formatNoteDate(entry.created_at)}</span>
                         </div>
                         <p className="event-description">{entry.note}</p>
                       </div>
@@ -1051,27 +1070,113 @@ function CheckInsPanel({
   );
 }
 
-function SettingsPanel({ user }) {
+function SettingsPanel({ user, onUpdateProfile }) {
+  const [fullName, setFullName] = useState(user.full_name || "");
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  useEffect(() => {
+    setFullName(user.full_name || "");
+    setEditing(false);
+    setError("");
+    setSuccess("");
+  }, [user.id, user.full_name]);
+
   return (
     <div className="drawer-stack">
       <div className="drawer-header">
         <p className="eyebrow">Settings</p>
-        <h2>Workspace Preferences</h2>
-        <p className="lede">A simple placeholder for account and app settings while we shape the main experience.</p>
+        <h2>Profile</h2>
+        <p className="lede">Update your name for the director workspace.</p>
       </div>
+
+      {!editing ? (
+        <div className="setting-card">
+          <strong>Display name</strong>
+          <span>{user.full_name}</span>
+          <button
+            type="button"
+            className="secondary-button secondary-button--compact"
+            onClick={() => {
+              setError("");
+              setSuccess("");
+              setFullName(user.full_name || "");
+              setEditing(true);
+            }}
+          >
+            Edit
+          </button>
+        </div>
+      ) : (
+        <form
+          className="stack-form"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            setError("");
+            setSuccess("");
+            const nextName = fullName.trim();
+            if (nextName.length < 2) {
+              setError("Name must be at least 2 characters.");
+              return;
+            }
+            setSaving(true);
+            try {
+              await onUpdateProfile({ full_name: nextName });
+              setSuccess("Profile updated.");
+              setEditing(false);
+            } catch (err) {
+              setError(err?.message || "Unable to update profile.");
+            } finally {
+              setSaving(false);
+            }
+          }}
+        >
+          <label>
+            Display name
+            <input
+              type="text"
+              value={fullName}
+              onChange={(event) => setFullName(event.target.value)}
+              placeholder="Grace Director"
+              required
+              autoFocus
+            />
+          </label>
+
+          {error ? <p className="error-banner">{error}</p> : null}
+          {success ? <p className="success-banner">{success}</p> : null}
+
+          <div className="auth-actions">
+            <button type="submit" className="primary-button" disabled={saving}>
+              {saving ? "Saving..." : "Save"}
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => {
+                setError("");
+                setSuccess("");
+                setFullName(user.full_name || "");
+                setEditing(false);
+              }}
+              disabled={saving}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
 
       <div className="settings-list">
         <div className="setting-card">
-          <strong>Signed In User</strong>
-          <span>{user.full_name}</span>
+          <strong>Email</strong>
+          <span>{user.email}</span>
         </div>
         <div className="setting-card">
           <strong>Role</strong>
           <span>{user.role}</span>
-        </div>
-        <div className="setting-card">
-          <strong>Current Theme</strong>
-          <span>{user.role === "director" ? "Director planning palette" : "Resident warm palette"}</span>
         </div>
       </div>
     </div>
@@ -1199,6 +1304,7 @@ function Dashboard({
   onOpenManageUsers,
   onOpenCreateUser,
   onOpenSettings,
+  onUpdateProfile,
   onCreateEvent,
   onCreateUser,
   onToggleAttendance,
@@ -1239,7 +1345,11 @@ function Dashboard({
           <p className="eyebrow">{copy.dashboardEyebrow}</p>
           <h1>{copy.dashboardTitle}</h1>
           <p className="lede">
-            Signed in as {user.full_name}. Role: <strong>{user.role}</strong>. {copy.dashboardDescription}
+            Signed in as {user.full_name}.
+            <br />
+            Role: <strong>{user.role.charAt(0).toUpperCase() + user.role.slice(1)}</strong>.
+            <br />
+            {copy.dashboardDescription}
           </p>
         </div>
 
@@ -1357,7 +1467,7 @@ function Dashboard({
             </div>
           ) : null}
 
-          {drawerView === "settings" ? <SettingsPanel user={user} /> : null}
+          {drawerView === "settings" ? <SettingsPanel user={user} onUpdateProfile={onUpdateProfile} /> : null}
         </aside>
       </main>
 
@@ -1708,6 +1818,23 @@ export default function App() {
     }
   };
 
+  const handleUpdateProfile = async (payload) => {
+    if (!user || user.role !== "director") {
+      throw new Error("Please sign in as a director first.");
+    }
+
+    const updated = await apiRequest(`/users/${user.id}?director_id=${user.id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload)
+    });
+
+    setUser(updated);
+    // Refresh lists where the director's name may appear.
+    await fetchUsers();
+    await fetchCheckIns(updated);
+    return updated;
+  };
+
   const handleLogout = async () => {
     if (isFirebaseAuthConfigured) {
       await signOut(auth);
@@ -1816,6 +1943,7 @@ export default function App() {
         setCreateUserSuccess("");
       }}
       onOpenSettings={() => {}}
+      onUpdateProfile={handleUpdateProfile}
       onCreateEvent={handleCreateEvent}
       onCreateUser={handleCreateUser}
       onToggleAttendance={handleToggleAttendance}

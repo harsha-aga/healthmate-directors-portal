@@ -53,6 +53,10 @@ class AppStore(ABC):
         pass
 
     @abstractmethod
+    def update_user(self, user_id: int, full_name: str) -> Optional[dict]:
+        pass
+
+    @abstractmethod
     def list_events(self, community_id: int) -> list[dict]:
         pass
 
@@ -184,6 +188,14 @@ class SQLiteStore(AppStore):
 
     def get_user(self, user_id: int) -> Optional[dict]:
         with get_connection() as connection:
+            return connection.execute(
+                "SELECT id, community_id, full_name, email, role FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+
+    def update_user(self, user_id: int, full_name: str) -> Optional[dict]:
+        with get_connection() as connection:
+            connection.execute("UPDATE users SET full_name = ? WHERE id = ?", (full_name, user_id))
             return connection.execute(
                 "SELECT id, community_id, full_name, email, role FROM users WHERE id = ?",
                 (user_id,),
@@ -388,6 +400,33 @@ class SQLiteStore(AppStore):
 
 
 class FirestoreStore(AppStore):
+    @staticmethod
+    def _get_with_default(data: dict, key: str, default):
+        value = data.get(key, default)
+        return default if value is None else value
+
+    def _normalize_user_snapshot(self, snapshot) -> dict:
+        """
+        Firestore documents created before we introduced multi-community may be missing community_id.
+        Default them to 1 and best-effort backfill the field so future reads are consistent.
+        """
+        data = self._doc_to_dict(snapshot)
+        if "community_id" not in data or data.get("community_id") is None:
+            try:
+                snapshot.reference.update({"community_id": 1})
+            except Exception:
+                pass
+            data["community_id"] = 1
+
+        # Return only the public fields we expose.
+        return {
+            "id": int(self._get_with_default(data, "id", 0)),
+            "community_id": int(self._get_with_default(data, "community_id", 1)),
+            "full_name": str(self._get_with_default(data, "full_name", "")),
+            "email": str(self._get_with_default(data, "email", "")),
+            "role": str(self._get_with_default(data, "role", "")),
+        }
+
     def create_community(self, name: str) -> dict:
         community_id = self._next_id("communities")
         community = {
@@ -457,14 +496,23 @@ class FirestoreStore(AppStore):
     def _find_user_by_email(self, email: str) -> Optional[dict]:
         users = self._collection("users").where("email", "==", email).limit(1).stream()
         for user in users:
-            return self._doc_to_dict(user)
+            return self._normalize_user_snapshot(user)
         return None
 
     def login(self, email: str, password: str) -> Optional[dict]:
-        user = self._find_user_by_email(email)
-        if not user or user.get("password") != password:
+        # NOTE: This path is only used in SQLite mode; Firestore mode uses Firebase Auth tokens.
+        snapshot_stream = self._collection("users").where("email", "==", email).limit(1).stream()
+        snapshot = None
+        for doc in snapshot_stream:
+            snapshot = doc
+            break
+        if not snapshot:
             return None
-        return {field: user[field] for field in USER_FIELDS}
+        raw = self._doc_to_dict(snapshot)
+        if raw.get("password") != password:
+            return None
+        normalized = self._normalize_user_snapshot(snapshot)
+        return {field: normalized[field] for field in USER_FIELDS}
 
     def list_users(self, role: Optional[str] = None, community_id: Optional[int] = None) -> list[dict]:
         query = self._collection("users")
@@ -472,7 +520,7 @@ class FirestoreStore(AppStore):
             query = query.where("community_id", "==", int(community_id))
         if role:
             query = query.where("role", "==", role)
-        users = [{field: user.to_dict()[field] for field in USER_FIELDS} for user in query.stream()]
+        users = [{field: self._normalize_user_snapshot(user)[field] for field in USER_FIELDS} for user in query.stream()]
         return sorted(users, key=lambda user: user["full_name"])
 
     def create_user(self, payload: UserCreateRequest, community_id: int) -> dict:
@@ -493,17 +541,28 @@ class FirestoreStore(AppStore):
         return {field: user[field] for field in USER_FIELDS}
 
     def get_user_by_email(self, email: str) -> Optional[dict]:
-        user = self._find_user_by_email(email)
-        if not user:
-            return None
-        return {field: user[field] for field in USER_FIELDS}
+        snapshot_stream = self._collection("users").where("email", "==", email).limit(1).stream()
+        for snapshot in snapshot_stream:
+            normalized = self._normalize_user_snapshot(snapshot)
+            return {field: normalized[field] for field in USER_FIELDS}
+        return None
 
     def get_user(self, user_id: int) -> Optional[dict]:
         snapshot = self._collection("users").document(str(user_id)).get()
         if not snapshot.exists:
             return None
-        user = self._doc_to_dict(snapshot)
-        return {field: user[field] for field in USER_FIELDS}
+        normalized = self._normalize_user_snapshot(snapshot)
+        return {field: normalized[field] for field in USER_FIELDS}
+
+    def update_user(self, user_id: int, full_name: str) -> Optional[dict]:
+        ref = self._collection("users").document(str(user_id))
+        snapshot = ref.get()
+        if not snapshot.exists:
+            return None
+        ref.update({"full_name": full_name})
+        refreshed = ref.get()
+        normalized = self._normalize_user_snapshot(refreshed)
+        return {field: normalized[field] for field in USER_FIELDS}
 
     def list_events(self, community_id: int) -> list[dict]:
         query = self._collection("events").where("community_id", "==", int(community_id))

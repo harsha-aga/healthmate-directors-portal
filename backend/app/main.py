@@ -21,6 +21,7 @@ from .schemas import (
     ResidentNoteCreateRequest,
     ResidentNoteResponse,
     UserCreateRequest,
+    UserUpdateRequest,
     UserResponse,
 )
 from .store import get_store
@@ -135,7 +136,16 @@ def _require_same_community(user: dict, community_id: int) -> None:
 
 @app.get("/health")
 def health_check() -> dict:
-    return {"status": "ok"}
+    store = os.getenv("HEALTHMATE_STORE", "sqlite").lower()
+    firebase_ready = False
+    try:
+        import firebase_admin
+
+        firebase_ready = bool(firebase_admin._apps)
+    except Exception:
+        firebase_ready = False
+
+    return {"status": "ok", "store": store, "firebase_admin_initialized": firebase_ready}
 
 
 @app.post("/communities", status_code=status.HTTP_201_CREATED)
@@ -233,6 +243,24 @@ def create_user(payload: UserCreateRequest, director_id: int = Query(...)) -> Us
         raise HTTPException(status_code=403, detail="Only directors can create users")
     community_id = int(director["community_id"])
     return _row_to_user(get_store().create_user(payload, community_id))
+
+
+@app.patch("/users/{user_id}")
+def update_user(user_id: int, payload: UserUpdateRequest, director_id: int = Query(...)) -> UserResponse:
+    """
+    Update the signed-in director's profile.
+    For now we only allow updating your own name from the web app.
+    """
+    director = _get_user(director_id)
+    if director["role"] != "director":
+        raise HTTPException(status_code=403, detail="Only directors can update profiles")
+    if int(director["id"]) != int(user_id):
+        raise HTTPException(status_code=403, detail="You can only update your own profile")
+
+    updated = get_store().update_user(user_id=user_id, full_name=payload.full_name)
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+    return _row_to_user(updated)
 
 
 @app.get("/events")
