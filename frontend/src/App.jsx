@@ -1120,6 +1120,13 @@ function FallReportsPanel({ residents, reports, loading, error, onCreateReport }
   });
 
   const optionLabelForResident = (resident) => `${resident.full_name} (${resident.email})`;
+  const residentLabelById = useMemo(() => {
+    const map = new Map();
+    (residents || []).forEach((resident) => {
+      map.set(String(resident.id), optionLabelForResident(resident));
+    });
+    return map;
+  }, [residents]);
 
   useEffect(() => {
     if (!residents?.length) {
@@ -1359,7 +1366,9 @@ function FallReportsPanel({ residents, reports, loading, error, onCreateReport }
                     </div>
                     <h4 className="event-title">{report.location}</h4>
                     <p className="event-description">
-                      {report.resident_id ? `Resident ID: ${report.resident_id}.` : "Resident not specified."}{" "}
+                      {report.resident_id
+                        ? `Resident: ${residentLabelById.get(String(report.resident_id)) || `#${report.resident_id}`}.`
+                        : "Resident not specified."}{" "}
                       {report.witnessed ? "Witnessed." : "Unwitnessed."} {report.ems_called ? "EMS called." : "EMS not called."}{" "}
                       {report.family_notified ? "Family notified." : "Family not notified."}
                     </p>
