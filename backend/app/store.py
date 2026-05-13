@@ -14,6 +14,7 @@ from .schemas import (
     CheckInCreateRequest,
     CheckInUpdateRequest,
     EventCreateRequest,
+    FallReportCreateRequest,
     ResidentNoteCreateRequest,
     UserCreateRequest,
 )
@@ -49,7 +50,19 @@ class AppStore(ABC):
         pass
 
     @abstractmethod
+    def get_portal_user_for_firebase(self, firebase_uid: str, email: str) -> Optional[dict]:
+        """
+        Bridge Firebase Auth users (mobile) to portal users (director portal) so we can gate access.
+        Implementations may auto-link a portal user record to the Firebase UID on first successful match.
+        """
+        pass
+
+    @abstractmethod
     def get_user(self, user_id: int) -> Optional[dict]:
+        pass
+
+    @abstractmethod
+    def get_director(self, director_id: int) -> Optional[dict]:
         pass
 
     @abstractmethod
@@ -112,6 +125,14 @@ class AppStore(ABC):
     def create_resident_note(self, director_id: int, payload: ResidentNoteCreateRequest, community_id: int) -> dict:
         pass
 
+    @abstractmethod
+    def list_fall_reports(self, director_id: int, community_id: int) -> list[dict]:
+        pass
+
+    @abstractmethod
+    def create_fall_report(self, director_id: int, payload, community_id: int) -> dict:
+        pass
+
 
 class SQLiteStore(AppStore):
     def create_community(self, name: str) -> dict:
@@ -164,14 +185,26 @@ class SQLiteStore(AppStore):
     def create_user(self, payload: UserCreateRequest, community_id: int) -> dict:
         try:
             with get_connection() as connection:
+                password = payload.password or ""
                 cursor = connection.execute(
                     """
                     INSERT INTO users (community_id, full_name, email, password, role)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (community_id, payload.full_name, payload.email, payload.password, payload.role),
+                    (community_id, payload.full_name, payload.email, password, payload.role),
                 )
                 user_id = cursor.lastrowid
+
+                if payload.role == "director":
+                    # Keep a director-specific table for director portal needs.
+                    connection.execute(
+                        """
+                        INSERT OR REPLACE INTO directors (id, community_id, full_name, email, password, role)
+                        VALUES (?, ?, ?, ?, ?, 'director')
+                        """,
+                        (user_id, community_id, payload.full_name, payload.email, password),
+                    )
+
                 return connection.execute(
                     "SELECT id, community_id, full_name, email, role FROM users WHERE id = ?",
                     (user_id,),
@@ -186,6 +219,10 @@ class SQLiteStore(AppStore):
                 (email,),
             ).fetchone()
 
+    def get_portal_user_for_firebase(self, firebase_uid: str, email: str) -> Optional[dict]:
+        # SQLite mode doesn't integrate with Firebase Auth; treat email lookup as the bridge.
+        return self.get_user_by_email(email)
+
     def get_user(self, user_id: int) -> Optional[dict]:
         with get_connection() as connection:
             return connection.execute(
@@ -193,9 +230,47 @@ class SQLiteStore(AppStore):
                 (user_id,),
             ).fetchone()
 
+    def get_director(self, director_id: int) -> Optional[dict]:
+        with get_connection() as connection:
+            director = connection.execute(
+                "SELECT id, community_id, full_name, email, 'director' AS role FROM directors WHERE id = ?",
+                (director_id,),
+            ).fetchone()
+            if director:
+                return director
+
+            # Backwards-compat: if the directors table wasn't populated yet, fall back to users
+            # and backfill the directors row.
+            user = connection.execute(
+                "SELECT id, community_id, full_name, email, password, role FROM users WHERE id = ?",
+                (director_id,),
+            ).fetchone()
+            if not user or user.get("role") != "director":
+                return None
+
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO directors (id, community_id, full_name, email, password, role)
+                VALUES (?, ?, ?, ?, ?, 'director')
+                """,
+                (
+                    user["id"],
+                    user.get("community_id", 1) or 1,
+                    user["full_name"],
+                    user["email"],
+                    user.get("password", "") or "",
+                ),
+            )
+            return connection.execute(
+                "SELECT id, community_id, full_name, email, 'director' AS role FROM directors WHERE id = ?",
+                (director_id,),
+            ).fetchone()
+
     def update_user(self, user_id: int, full_name: str) -> Optional[dict]:
         with get_connection() as connection:
             connection.execute("UPDATE users SET full_name = ? WHERE id = ?", (full_name, user_id))
+            # If this user is a director, keep the directors table in sync.
+            connection.execute("UPDATE directors SET full_name = ? WHERE id = ?", (full_name, user_id))
             return connection.execute(
                 "SELECT id, community_id, full_name, email, role FROM users WHERE id = ?",
                 (user_id,),
@@ -398,8 +473,25 @@ class SQLiteStore(AppStore):
                 (note_id,),
             ).fetchone()
 
+    def list_fall_reports(self, director_id: int, community_id: int) -> list[dict]:
+        # SQLite mode doesn't currently support fall reports.
+        return []
+
+    def create_fall_report(self, director_id: int, payload, community_id: int) -> dict:
+        raise HTTPException(status_code=501, detail="Fall reports are only supported in Firestore mode.")
+
 
 class FirestoreStore(AppStore):
+    USERS_COLLECTION = "portal_users"
+    DIRECTORS_COLLECTION = "portal_directors"
+    COMMUNITIES_COLLECTION = "portal_communities"
+    EVENTS_COLLECTION = "portal_events"
+    ATTENDANCE_COLLECTION = "portal_attendance"
+    CHECKINS_COLLECTION = "portal_checkins"
+    RESIDENT_NOTES_COLLECTION = "portal_resident_notes"
+    FALL_REPORTS_COLLECTION = "portal_fall_reports"
+    METADATA_COLLECTION = "portal_metadata"
+
     @staticmethod
     def _get_with_default(data: dict, key: str, default):
         value = data.get(key, default)
@@ -428,15 +520,15 @@ class FirestoreStore(AppStore):
         }
 
     def create_community(self, name: str) -> dict:
-        community_id = self._next_id("communities")
+        community_id = self._next_id(self.COMMUNITIES_COLLECTION)
         community = {
             "id": community_id,
             "slug": f"community-{community_id}",
             "name": name,
             "created_at": self.firestore.SERVER_TIMESTAMP,
         }
-        self._collection("communities").document(str(community_id)).set(community)
-        snapshot = self._collection("communities").document(str(community_id)).get()
+        self._collection(self.COMMUNITIES_COLLECTION).document(str(community_id)).set(community)
+        snapshot = self._collection(self.COMMUNITIES_COLLECTION).document(str(community_id)).get()
         return self._doc_to_dict(snapshot)
 
     def __init__(self) -> None:
@@ -494,9 +586,20 @@ class FirestoreStore(AppStore):
         return dict(data)
 
     def _find_user_by_email(self, email: str) -> Optional[dict]:
-        users = self._collection("users").where("email", "==", email).limit(1).stream()
+        users = self._collection(self.USERS_COLLECTION).where("email", "==", email).limit(1).stream()
         for user in users:
             return self._normalize_user_snapshot(user)
+        # Backwards-compat: older data may exist in `users` from before we namespaced collections.
+        legacy = self._collection("users").where("email", "==", email).limit(1).stream()
+        for user in legacy:
+            normalized = self._normalize_user_snapshot(user)
+            try:
+                self._collection(self.USERS_COLLECTION).document(str(normalized.get("id", ""))).set(
+                    user.to_dict() or {}, merge=True
+                )
+            except Exception:
+                pass
+            return normalized
         return None
 
     def login(self, email: str, password: str) -> Optional[dict]:
@@ -515,7 +618,7 @@ class FirestoreStore(AppStore):
         return {field: normalized[field] for field in USER_FIELDS}
 
     def list_users(self, role: Optional[str] = None, community_id: Optional[int] = None) -> list[dict]:
-        query = self._collection("users")
+        query = self._collection(self.USERS_COLLECTION)
         if community_id is not None:
             query = query.where("community_id", "==", int(community_id))
         if role:
@@ -527,31 +630,122 @@ class FirestoreStore(AppStore):
         if self._find_user_by_email(str(payload.email)):
             raise HTTPException(status_code=400, detail="A user with that email already exists")
 
-        user_id = self._next_id("users")
+        user_id = self._next_id(self.USERS_COLLECTION)
+        password = payload.password or ""
         user = {
             "id": user_id,
             "community_id": int(community_id),
             "full_name": payload.full_name,
             "email": str(payload.email),
-            "password": payload.password,
+            "password": password,
             "role": payload.role,
         }
-        self._collection("users").document(str(user_id)).set(user)
-        self._ensure_auth_user(user["email"], user["password"], user["full_name"])
+        self._collection(self.USERS_COLLECTION).document(str(user_id)).set(user)
+        if payload.role == "director":
+            self._collection(self.DIRECTORS_COLLECTION).document(str(user_id)).set(dict(user))
+            # Directors sign in via Firebase Auth (Email/Password), so ensure an auth user exists.
+            self._ensure_auth_user(user["email"], user["password"], user["full_name"])
         return {field: user[field] for field in USER_FIELDS}
 
     def get_user_by_email(self, email: str) -> Optional[dict]:
-        snapshot_stream = self._collection("users").where("email", "==", email).limit(1).stream()
-        for snapshot in snapshot_stream:
+        normalized = self._find_user_by_email(email)
+        if not normalized:
+            return None
+        return {field: normalized[field] for field in USER_FIELDS}
+
+    def get_portal_user_for_firebase(self, firebase_uid: str, email: str) -> Optional[dict]:
+        """
+        Bridge a Firebase Auth user (mobile) to a portal user row.
+
+        We accept any of:
+        - portal_users doc id == firebase UID
+        - portal_users.firebase_uid == firebase UID
+        - portal_users.email == email (and then we backfill firebase_uid for future lookups)
+        """
+        firebase_uid = str(firebase_uid or "").strip()
+        email = str(email or "").strip()
+        if not firebase_uid or not email:
+            return None
+
+        # Fast path: doc id is the UID.
+        direct = self._collection(self.USERS_COLLECTION).document(firebase_uid).get()
+        if direct.exists:
+            normalized = self._normalize_user_snapshot(direct)
+            return {field: normalized[field] for field in USER_FIELDS}
+
+        # Next: explicit firebase_uid field.
+        matches = (
+            self._collection(self.USERS_COLLECTION)
+            .where("firebase_uid", "==", firebase_uid)
+            .limit(1)
+            .stream()
+        )
+        for snapshot in matches:
             normalized = self._normalize_user_snapshot(snapshot)
             return {field: normalized[field] for field in USER_FIELDS}
+
+        # Fallback: email match; if found, backfill firebase_uid so future checks are stable.
+        email_matches = (
+            self._collection(self.USERS_COLLECTION)
+            .where("email", "==", email)
+            .limit(1)
+            .stream()
+        )
+        for snapshot in email_matches:
+            try:
+                snapshot.reference.set({"firebase_uid": firebase_uid}, merge=True)
+            except Exception:
+                pass
+            normalized = self._normalize_user_snapshot(snapshot)
+            return {field: normalized[field] for field in USER_FIELDS}
+
         return None
 
     def get_user(self, user_id: int) -> Optional[dict]:
-        snapshot = self._collection("users").document(str(user_id)).get()
+        snapshot = self._collection(self.USERS_COLLECTION).document(str(user_id)).get()
         if not snapshot.exists:
-            return None
+            # Backwards-compat: migrate on read from legacy users collection.
+            legacy = self._collection("users").document(str(user_id)).get()
+            if not legacy.exists:
+                return None
+            raw = legacy.to_dict() or {}
+            try:
+                self._collection(self.USERS_COLLECTION).document(str(user_id)).set(raw, merge=True)
+            except Exception:
+                pass
+            snapshot = legacy
         normalized = self._normalize_user_snapshot(snapshot)
+        return {field: normalized[field] for field in USER_FIELDS}
+
+    def get_director(self, director_id: int) -> Optional[dict]:
+        snapshot = self._collection(self.DIRECTORS_COLLECTION).document(str(director_id)).get()
+        if snapshot.exists:
+            normalized = self._normalize_user_snapshot(snapshot)
+            # Ensure role stays director.
+            normalized["role"] = "director"
+            return {field: normalized[field] for field in USER_FIELDS}
+
+        # Backwards-compat: if director isn't in `directors` yet, fall back to users and backfill.
+        user_snapshot = self._collection(self.USERS_COLLECTION).document(str(director_id)).get()
+        if not user_snapshot.exists:
+            legacy = self._collection("users").document(str(director_id)).get()
+            if not legacy.exists:
+                return None
+            try:
+                self._collection(self.USERS_COLLECTION).document(str(director_id)).set(legacy.to_dict() or {}, merge=True)
+            except Exception:
+                pass
+            user_snapshot = legacy
+        raw = self._doc_to_dict(user_snapshot)
+        if str(raw.get("role", "")) != "director":
+            return None
+
+        normalized = self._normalize_user_snapshot(user_snapshot)
+        try:
+            self._collection(self.DIRECTORS_COLLECTION).document(str(director_id)).set(dict(raw), merge=True)
+        except Exception:
+            pass
+        normalized["role"] = "director"
         return {field: normalized[field] for field in USER_FIELDS}
 
     def update_user(self, user_id: int, full_name: str) -> Optional[dict]:
@@ -559,18 +753,26 @@ class FirestoreStore(AppStore):
         snapshot = ref.get()
         if not snapshot.exists:
             return None
+        current = self._doc_to_dict(snapshot)
         ref.update({"full_name": full_name})
+        if str(current.get("role", "")) == "director":
+            try:
+                self._collection("directors").document(str(user_id)).set(
+                    {**current, "full_name": full_name}, merge=True
+                )
+            except Exception:
+                pass
         refreshed = ref.get()
         normalized = self._normalize_user_snapshot(refreshed)
         return {field: normalized[field] for field in USER_FIELDS}
 
     def list_events(self, community_id: int) -> list[dict]:
-        query = self._collection("events").where("community_id", "==", int(community_id))
+        query = self._collection(self.EVENTS_COLLECTION).where("community_id", "==", int(community_id))
         events = [{field: event.to_dict()[field] for field in EVENT_FIELDS} for event in query.stream()]
         return sorted(events, key=lambda event: (event["event_date"], event["event_time"], event["id"]))
 
     def create_event(self, payload: EventCreateRequest, director_id: int, community_id: int) -> dict:
-        event_id = self._next_id("events")
+        event_id = self._next_id(self.EVENTS_COLLECTION)
         event = {
             "id": event_id,
             "community_id": int(community_id),
@@ -581,18 +783,18 @@ class FirestoreStore(AppStore):
             "image_url": payload.image_url or "",
             "created_by": director_id,
         }
-        self._collection("events").document(str(event_id)).set(event)
+        self._collection(self.EVENTS_COLLECTION).document(str(event_id)).set(event)
         return event
 
     def get_event(self, event_id: int) -> Optional[dict]:
-        snapshot = self._collection("events").document(str(event_id)).get()
+        snapshot = self._collection(self.EVENTS_COLLECTION).document(str(event_id)).get()
         if not snapshot.exists:
             return None
         event = self._doc_to_dict(snapshot)
         return {field: event[field] for field in EVENT_FIELDS}
 
     def list_participants(self, event_id: int) -> list[dict]:
-        attendance = self._collection("attendance").where("event_id", "==", event_id).stream()
+        attendance = self._collection(self.ATTENDANCE_COLLECTION).where("event_id", "==", event_id).stream()
         users = []
         for entry in attendance:
             user = self.get_user(self._doc_to_dict(entry)["user_id"])
@@ -601,20 +803,20 @@ class FirestoreStore(AppStore):
         return sorted(users, key=lambda user: user["full_name"])
 
     def is_attending(self, event_id: int, user_id: int) -> bool:
-        return self._collection("attendance").document(f"{user_id}_{event_id}").get().exists
+        return self._collection(self.ATTENDANCE_COLLECTION).document(f"{user_id}_{event_id}").get().exists
 
     def attend_event(self, event_id: int, user_id: int) -> None:
-        self._collection("attendance").document(f"{user_id}_{event_id}").set(
+        self._collection(self.ATTENDANCE_COLLECTION).document(f"{user_id}_{event_id}").set(
             {"user_id": user_id, "event_id": event_id}
         )
 
     def leave_event(self, event_id: int, user_id: int) -> None:
-        self._collection("attendance").document(f"{user_id}_{event_id}").delete()
+        self._collection(self.ATTENDANCE_COLLECTION).document(f"{user_id}_{event_id}").delete()
 
     def _seed(self) -> None:
         default_community_id = 1
-        if not list(self._collection("communities").limit(1).stream()):
-            self._collection("communities").document(str(default_community_id)).set(
+        if not list(self._collection(self.COMMUNITIES_COLLECTION).limit(1).stream()):
+            self._collection(self.COMMUNITIES_COLLECTION).document(str(default_community_id)).set(
                 {
                     "id": default_community_id,
                     "slug": "default",
@@ -622,10 +824,10 @@ class FirestoreStore(AppStore):
                     "created_at": self.firestore.SERVER_TIMESTAMP,
                 }
             )
-            self._collection("metadata").document("communities_counter").set({"value": default_community_id})
+            self._collection(self.METADATA_COLLECTION).document(f"{self.COMMUNITIES_COLLECTION}_counter").set({"value": default_community_id})
 
-        if list(self._collection("users").limit(1).stream()):
-            for user in self._collection("users").stream():
+        if list(self._collection(self.USERS_COLLECTION).limit(1).stream()):
+            for user in self._collection(self.USERS_COLLECTION).stream():
                 data = self._doc_to_dict(user)
                 if data.get("email") and data.get("password"):
                     self._ensure_auth_user(data["email"], data["password"], data.get("full_name", ""))
@@ -705,14 +907,46 @@ class FirestoreStore(AppStore):
         self.attend_event(events[1]["id"], resident_ids[1])
 
     def _ensure_auth_user(self, email: str, password: str, full_name: str) -> None:
+        """
+        Ensure a Firebase Auth user exists for this email.
+
+        For this project we also keep a (dev/demo) password in Firestore. If the Auth user
+        already exists, we best-effort sync its password + display name so directors can
+        sign in with the password shown in the portal seed data.
+        """
+        email = str(email or "").strip()
+        password = str(password or "")
+        full_name = str(full_name or "").strip()
+        if not email:
+            return
+
         try:
-            self.auth.get_user_by_email(email)
+            existing = self.auth.get_user_by_email(email)
         except self.auth.UserNotFoundError:
-            self.auth.create_user(email=email, password=password, display_name=full_name)
+            if password:
+                self.auth.create_user(email=email, password=password, display_name=full_name or None)
+            else:
+                self.auth.create_user(email=email, display_name=full_name or None)
+            return
+
+        # Best-effort sync for existing accounts.
+        try:
+            updates: dict = {}
+            if full_name and existing.display_name != full_name:
+                updates["display_name"] = full_name
+            # Only update password if we have one on record (avoids clobbering accounts that
+            # were intentionally created without a password in this portal DB).
+            if password:
+                updates["password"] = password
+            if updates:
+                self.auth.update_user(existing.uid, **updates)
+        except Exception:
+            # Never block app startup on Auth sync.
+            pass
 
     def list_checkins(self, director_id: int, community_id: int) -> list[dict]:
         checkins = (
-            self._collection("checkins")
+            self._collection(self.CHECKINS_COLLECTION)
             .where("community_id", "==", int(community_id))
             .where("director_id", "==", director_id)
             .stream()
@@ -721,7 +955,7 @@ class FirestoreStore(AppStore):
         return sorted(results, key=lambda entry: (entry.get("scheduled_date", ""), entry.get("scheduled_time", ""), entry.get("id", 0)))
 
     def create_checkin(self, director_id: int, payload: CheckInCreateRequest, community_id: int) -> dict:
-        checkin_id = self._next_id("checkins")
+        checkin_id = self._next_id(self.CHECKINS_COLLECTION)
         checkin = {
             "id": checkin_id,
             "community_id": int(community_id),
@@ -732,17 +966,17 @@ class FirestoreStore(AppStore):
             "notes": payload.notes or "",
             "status": "scheduled",
         }
-        self._collection("checkins").document(str(checkin_id)).set(checkin)
+        self._collection(self.CHECKINS_COLLECTION).document(str(checkin_id)).set(checkin)
         return dict(checkin)
 
     def get_checkin(self, checkin_id: int) -> Optional[dict]:
-        snapshot = self._collection("checkins").document(str(checkin_id)).get()
+        snapshot = self._collection(self.CHECKINS_COLLECTION).document(str(checkin_id)).get()
         if not snapshot.exists:
             return None
         return self._doc_to_dict(snapshot)
 
     def update_checkin(self, checkin_id: int, payload: CheckInUpdateRequest) -> Optional[dict]:
-        ref = self._collection("checkins").document(str(checkin_id))
+        ref = self._collection(self.CHECKINS_COLLECTION).document(str(checkin_id))
         snapshot = ref.get()
         if not snapshot.exists:
             return None
@@ -757,7 +991,7 @@ class FirestoreStore(AppStore):
         return self._doc_to_dict(refreshed)
 
     def delete_checkin(self, checkin_id: int) -> bool:
-        ref = self._collection("checkins").document(str(checkin_id))
+        ref = self._collection(self.CHECKINS_COLLECTION).document(str(checkin_id))
         snapshot = ref.get()
         if not snapshot.exists:
             return False
@@ -766,7 +1000,7 @@ class FirestoreStore(AppStore):
 
     def list_resident_notes(self, resident_id: int, director_id: int, community_id: int) -> list[dict]:
         notes = (
-            self._collection("resident_notes")
+            self._collection(self.RESIDENT_NOTES_COLLECTION)
             .where("community_id", "==", int(community_id))
             .where("resident_id", "==", resident_id)
             .where("director_id", "==", director_id)
@@ -776,7 +1010,7 @@ class FirestoreStore(AppStore):
         return sorted(results, key=lambda entry: (entry.get("created_at", ""), entry.get("id", 0)), reverse=True)
 
     def create_resident_note(self, director_id: int, payload: ResidentNoteCreateRequest, community_id: int) -> dict:
-        note_id = self._next_id("resident_notes")
+        note_id = self._next_id(self.RESIDENT_NOTES_COLLECTION)
         note = {
             "id": note_id,
             "community_id": int(community_id),
@@ -786,9 +1020,46 @@ class FirestoreStore(AppStore):
             # ISO-ish string so we can sort easily without extra client formatting.
             "created_at": self.firestore.SERVER_TIMESTAMP,
         }
-        self._collection("resident_notes").document(str(note_id)).set(note)
+        self._collection(self.RESIDENT_NOTES_COLLECTION).document(str(note_id)).set(note)
         # Resolve server timestamp.
-        snapshot = self._collection("resident_notes").document(str(note_id)).get()
+        snapshot = self._collection(self.RESIDENT_NOTES_COLLECTION).document(str(note_id)).get()
+        return self._doc_to_dict(snapshot)
+
+    def list_fall_reports(self, director_id: int, community_id: int) -> list[dict]:
+        reports = (
+            self._collection(self.FALL_REPORTS_COLLECTION)
+            .where("community_id", "==", int(community_id))
+            .where("director_id", "==", director_id)
+            .stream()
+        )
+        results = [self._doc_to_dict(entry) for entry in reports]
+        # created_at may be a timestamp; sort by string conversion fallback.
+        return sorted(
+            results,
+            key=lambda entry: (str(entry.get("incident_date", "")), str(entry.get("incident_time", "")), int(entry.get("id", 0))),
+            reverse=True,
+        )
+
+    def create_fall_report(self, director_id: int, payload: FallReportCreateRequest, community_id: int) -> dict:
+        report_id = self._next_id(self.FALL_REPORTS_COLLECTION)
+        report = {
+            "id": report_id,
+            "community_id": int(community_id),
+            "director_id": director_id,
+            "resident_id": int(payload.resident_id) if payload.resident_id is not None else None,
+            "incident_date": payload.incident_date,
+            "incident_time": payload.incident_time,
+            "location": payload.location,
+            "witnessed": bool(payload.witnessed),
+            "injuries": payload.injuries or "",
+            "immediate_action": payload.immediate_action or "",
+            "ems_called": bool(payload.ems_called),
+            "family_notified": bool(payload.family_notified),
+            "notes": payload.notes or "",
+            "created_at": self.firestore.SERVER_TIMESTAMP,
+        }
+        self._collection(self.FALL_REPORTS_COLLECTION).document(str(report_id)).set(report)
+        snapshot = self._collection(self.FALL_REPORTS_COLLECTION).document(str(report_id)).get()
         return self._doc_to_dict(snapshot)
 
 

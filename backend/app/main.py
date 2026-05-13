@@ -5,6 +5,7 @@ import os
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 
 from .schemas import (
@@ -16,8 +17,12 @@ from .schemas import (
     CommunityResponse,
     EventCreateRequest,
     EventResponse,
+    MobileEventResponse,
+    MobilePortalStatusResponse,
     FirebaseLoginRequest,
     LoginRequest,
+    FallReportCreateRequest,
+    FallReportResponse,
     ResidentNoteCreateRequest,
     ResidentNoteResponse,
     UserCreateRequest,
@@ -31,7 +36,9 @@ app = FastAPI(title="HealthMate API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
+    # Dev-friendly: accept any localhost/127.0.0.1 port (Vite can move ports).
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -89,6 +96,13 @@ def _get_user(user_id: int) -> dict:
     return user
 
 
+def _get_director(director_id: int) -> dict:
+    director = get_store().get_director(director_id)
+    if not director:
+        raise HTTPException(status_code=404, detail="Director not found")
+    return director
+
+
 def _build_event_response(event: dict, viewer_id: Optional[int] = None) -> EventResponse:
     store = get_store()
     participants = store.list_participants(event["id"])
@@ -129,6 +143,31 @@ def _build_resident_note_response(note: dict) -> ResidentNoteResponse:
     )
 
 
+def _build_fall_report_response(report: dict) -> FallReportResponse:
+    created_at = report.get("created_at")
+    if hasattr(created_at, "isoformat"):
+        created_at_value = created_at.isoformat()
+    else:
+        created_at_value = str(created_at or "")
+
+    return FallReportResponse(
+        id=int(report.get("id", 0)),
+        community_id=int(report.get("community_id", 0) or 0),
+        director_id=int(report.get("director_id", 0) or 0),
+        resident_id=int(report["resident_id"]) if report.get("resident_id") is not None else None,
+        incident_date=str(report.get("incident_date", "")),
+        incident_time=str(report.get("incident_time", "")),
+        location=str(report.get("location", "")),
+        witnessed=bool(report.get("witnessed", False)),
+        injuries=str(report.get("injuries", "") or ""),
+        immediate_action=str(report.get("immediate_action", "") or ""),
+        ems_called=bool(report.get("ems_called", False)),
+        family_notified=bool(report.get("family_notified", False)),
+        notes=str(report.get("notes", "") or ""),
+        created_at=created_at_value,
+    )
+
+
 def _require_same_community(user: dict, community_id: int) -> None:
     if int(user.get("community_id", 0)) != int(community_id):
         raise HTTPException(status_code=403, detail="User does not belong to this community")
@@ -138,14 +177,36 @@ def _require_same_community(user: dict, community_id: int) -> None:
 def health_check() -> dict:
     store = os.getenv("HEALTHMATE_STORE", "sqlite").lower()
     firebase_ready = False
+    firebase_project_id = ""
+    credentials_project_id = ""
     try:
         import firebase_admin
 
         firebase_ready = bool(firebase_admin._apps)
+        if firebase_ready:
+            try:
+                firebase_project_id = getattr(firebase_admin.get_app(), "project_id", "") or ""
+            except Exception:
+                firebase_project_id = ""
     except Exception:
         firebase_ready = False
 
-    return {"status": "ok", "store": store, "firebase_admin_initialized": firebase_ready}
+    # Best-effort expose which service account project_id we loaded (helps debug mismatches).
+    cred_file = os.getenv("FIREBASE_SERVICE_ACCOUNT_FILE") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if cred_file and os.path.exists(cred_file):
+        try:
+            with open(cred_file, "r", encoding="utf-8") as handle:
+                credentials_project_id = json.load(handle).get("project_id", "") or ""
+        except Exception:
+            credentials_project_id = ""
+
+    return {
+        "status": "ok",
+        "store": store,
+        "firebase_admin_initialized": firebase_ready,
+        "firebase_project_id": firebase_project_id,
+        "credentials_project_id": credentials_project_id,
+    }
 
 
 @app.post("/communities", status_code=status.HTTP_201_CREATED)
@@ -226,11 +287,108 @@ def firebase_login(payload: FirebaseLoginRequest) -> UserResponse:
     return _row_to_user(user)
 
 
+def _get_user_from_bearer(
+    authorization: Optional[str],
+) -> tuple[Optional[dict], Optional[str], Optional[str], Optional[str]]:
+    if not authorization:
+        return None, "Missing Authorization header", None, None
+    value = str(authorization).strip()
+    if not value.lower().startswith("bearer "):
+        return None, "Authorization header must be 'Bearer <token>'", None, None
+    token = value.split(" ", 1)[1].strip()
+    if not token:
+        return None, "Authorization token is empty", None, None
+
+    try:
+        from firebase_admin import auth
+
+        decoded = auth.verify_id_token(token)
+    except Exception as error:
+        return None, f"Token verification failed: {error}", None, None
+
+    uid = decoded.get("uid")
+    email = decoded.get("email")
+    if not email:
+        return None, "Token has no email claim", None, str(uid) if uid else None
+
+    portal_user = get_store().get_portal_user_for_firebase(str(uid or ""), str(email))
+    return portal_user, None, str(email), str(uid) if uid else None
+
+
+@app.get("/mobile/events")
+def list_mobile_events(
+    start: Optional[str] = Query(default=None, description="Start date (YYYY-MM-DD)"),
+    end: Optional[str] = Query(default=None, description="End date (YYYY-MM-DD)"),
+    authorization: Optional[str] = Header(default=None),
+) -> list[MobileEventResponse]:
+    """
+    Mobile-friendly events feed.
+
+    Auth: pass Firebase ID token as `Authorization: Bearer <token>`.
+    Returns events for the authenticated user's community.
+    """
+    viewer, auth_error, email, _uid = _get_user_from_bearer(authorization)
+    if not viewer:
+        if auth_error:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=auth_error)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"This Firebase account ({email or 'unknown'}) is not registered in HealthMate.",
+        )
+
+    community_id = int(viewer["community_id"])
+    events = get_store().list_events(community_id)
+    if start:
+        events = [event for event in events if event["event_date"] >= start]
+    if end:
+        events = [event for event in events if event["event_date"] <= end]
+
+    store = get_store()
+    viewer_id = int(viewer["id"])
+    results: list[MobileEventResponse] = []
+    for event in events:
+        attending = store.is_attending(int(event["id"]), viewer_id)
+        results.append(
+            MobileEventResponse(
+                id=int(event["id"]),
+                community_id=int(event.get("community_id", 0) or 0),
+                event_date=event["event_date"],
+                event_time=event["event_time"],
+                name=event["name"],
+                description=event["description"],
+                image_url=event.get("image_url", "") or "",
+                created_by=int(event["created_by"]),
+                attending=attending,
+            )
+        )
+    return results
+
+
+@app.get("/mobile/portal-status")
+def mobile_portal_status(
+    authorization: Optional[str] = Header(default=None),
+) -> MobilePortalStatusResponse:
+    """
+    Whether the signed-in Firebase user is linked to a portal_users record.
+    The iOS app should use this to show/hide the calendar.
+    """
+    viewer, auth_error, email, uid = _get_user_from_bearer(authorization)
+    if not viewer:
+        if auth_error:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=auth_error)
+        return MobilePortalStatusResponse(allowed=False, email=email or "", uid=uid or "", portal_user=None)
+
+    return MobilePortalStatusResponse(
+        allowed=True,
+        email=email or "",
+        uid=uid or "",
+        portal_user=_row_to_user(viewer),
+    )
+
+
 @app.get("/users")
 def list_users(director_id: int = Query(...), role: Optional[str] = Query(default=None)) -> list[UserResponse]:
-    director = _get_user(director_id)
-    if director["role"] != "director":
-        raise HTTPException(status_code=403, detail="Only directors can list users")
+    director = _get_director(director_id)
     community_id = int(director["community_id"])
     users = get_store().list_users(role=role, community_id=community_id)
     return [_row_to_user(user) for user in users]
@@ -238,9 +396,7 @@ def list_users(director_id: int = Query(...), role: Optional[str] = Query(defaul
 
 @app.post("/users", status_code=status.HTTP_201_CREATED)
 def create_user(payload: UserCreateRequest, director_id: int = Query(...)) -> UserResponse:
-    director = _get_user(director_id)
-    if director["role"] != "director":
-        raise HTTPException(status_code=403, detail="Only directors can create users")
+    director = _get_director(director_id)
     community_id = int(director["community_id"])
     return _row_to_user(get_store().create_user(payload, community_id))
 
@@ -251,9 +407,7 @@ def update_user(user_id: int, payload: UserUpdateRequest, director_id: int = Que
     Update the signed-in director's profile.
     For now we only allow updating your own name from the web app.
     """
-    director = _get_user(director_id)
-    if director["role"] != "director":
-        raise HTTPException(status_code=403, detail="Only directors can update profiles")
+    director = _get_director(director_id)
     if int(director["id"]) != int(user_id):
         raise HTTPException(status_code=403, detail="You can only update your own profile")
 
@@ -275,10 +429,7 @@ def list_events(viewer_id: Optional[int] = Query(default=None)) -> list[EventRes
 
 @app.post("/events", status_code=status.HTTP_201_CREATED)
 def create_event(payload: EventCreateRequest, director_id: int = Query(...)) -> EventResponse:
-    director = _get_user(director_id)
-    if director["role"] != "director":
-        raise HTTPException(status_code=403, detail="Only directors can create events")
-
+    director = _get_director(director_id)
     community_id = int(director["community_id"])
     event = get_store().create_event(payload, director_id, community_id)
     return _build_event_response(event, viewer_id=director_id)
@@ -316,10 +467,7 @@ def leave_event(event_id: int, payload: AttendanceToggleRequest) -> EventRespons
 
 @app.get("/checkins")
 def list_checkins(director_id: int = Query(...)) -> list[CheckInResponse]:
-    director = _get_user(director_id)
-    if director["role"] != "director":
-        raise HTTPException(status_code=403, detail="Only directors can view check-ins")
-
+    director = _get_director(director_id)
     community_id = int(director["community_id"])
     checkins = get_store().list_checkins(director_id, community_id)
     return [_build_checkin_response(checkin) for checkin in checkins]
@@ -327,9 +475,7 @@ def list_checkins(director_id: int = Query(...)) -> list[CheckInResponse]:
 
 @app.post("/checkins", status_code=status.HTTP_201_CREATED)
 def create_checkin(payload: CheckInCreateRequest, director_id: int = Query(...)) -> CheckInResponse:
-    director = _get_user(director_id)
-    if director["role"] != "director":
-        raise HTTPException(status_code=403, detail="Only directors can schedule check-ins")
+    director = _get_director(director_id)
     community_id = int(director["community_id"])
 
     resident = _get_user(payload.resident_id)
@@ -343,9 +489,7 @@ def create_checkin(payload: CheckInCreateRequest, director_id: int = Query(...))
 
 @app.patch("/checkins/{checkin_id}")
 def update_checkin(checkin_id: int, payload: CheckInUpdateRequest, director_id: int = Query(...)) -> CheckInResponse:
-    director = _get_user(director_id)
-    if director["role"] != "director":
-        raise HTTPException(status_code=403, detail="Only directors can update check-ins")
+    director = _get_director(director_id)
 
     existing = get_store().get_checkin(checkin_id)
     if not existing:
@@ -361,9 +505,7 @@ def update_checkin(checkin_id: int, payload: CheckInUpdateRequest, director_id: 
 
 @app.delete("/checkins/{checkin_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_checkin(checkin_id: int, director_id: int = Query(...)) -> None:
-    director = _get_user(director_id)
-    if director["role"] != "director":
-        raise HTTPException(status_code=403, detail="Only directors can delete check-ins")
+    director = _get_director(director_id)
 
     existing = get_store().get_checkin(checkin_id)
     if not existing:
@@ -378,9 +520,7 @@ def delete_checkin(checkin_id: int, director_id: int = Query(...)) -> None:
 
 @app.get("/resident-notes")
 def list_resident_notes(resident_id: int = Query(...), director_id: int = Query(...)) -> list[ResidentNoteResponse]:
-    director = _get_user(director_id)
-    if director["role"] != "director":
-        raise HTTPException(status_code=403, detail="Only directors can view resident notes")
+    director = _get_director(director_id)
     community_id = int(director["community_id"])
 
     resident = _get_user(resident_id)
@@ -394,9 +534,7 @@ def list_resident_notes(resident_id: int = Query(...), director_id: int = Query(
 
 @app.post("/resident-notes", status_code=status.HTTP_201_CREATED)
 def create_resident_note(payload: ResidentNoteCreateRequest, director_id: int = Query(...)) -> ResidentNoteResponse:
-    director = _get_user(director_id)
-    if director["role"] != "director":
-        raise HTTPException(status_code=403, detail="Only directors can create resident notes")
+    director = _get_director(director_id)
     community_id = int(director["community_id"])
 
     resident = _get_user(payload.resident_id)
@@ -406,3 +544,24 @@ def create_resident_note(payload: ResidentNoteCreateRequest, director_id: int = 
 
     created = get_store().create_resident_note(director_id=director_id, payload=payload, community_id=community_id)
     return _build_resident_note_response(created)
+
+
+@app.get("/fall-reports")
+def list_fall_reports(director_id: int = Query(...)) -> list[FallReportResponse]:
+    director = _get_director(director_id)
+    community_id = int(director["community_id"])
+    reports = get_store().list_fall_reports(int(director["id"]), community_id)
+    return [_build_fall_report_response(report) for report in reports]
+
+
+@app.post("/fall-reports", status_code=status.HTTP_201_CREATED)
+def create_fall_report(payload: FallReportCreateRequest, director_id: int = Query(...)) -> FallReportResponse:
+    director = _get_director(director_id)
+    community_id = int(director["community_id"])
+
+    if payload.resident_id is not None:
+        resident = _get_user(int(payload.resident_id))
+        _require_same_community(resident, community_id)
+
+    created = get_store().create_fall_report(int(director["id"]), payload, community_id)
+    return _build_fall_report_response(created)

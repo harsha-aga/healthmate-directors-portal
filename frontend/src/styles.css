@@ -474,6 +474,28 @@ textarea {
   gap: 16px;
 }
 
+.form-row--checks {
+  display: grid;
+  gap: 10px;
+}
+
+.checkline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(80, 67, 55, 0.12);
+  background: rgba(255, 255, 255, 0.8);
+  font-weight: 700;
+  color: var(--text-soft);
+}
+
+.checkline input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+}
+
 .weekdays,
 .calendar-grid {
   display: grid;

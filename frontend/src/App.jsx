@@ -60,6 +60,19 @@ function formatLongDate(dateString) {
   return longDateFormatter.format(new Date(`${dateString}T00:00:00`));
 }
 
+function formatIncidentDateTime(dateString, timeString) {
+  if (!dateString || !timeString) {
+    return "";
+  }
+
+  const normalizedTime = String(timeString).trim().slice(0, 5);
+  const parsed = new Date(`${dateString}T${normalizedTime}:00`);
+  if (Number.isNaN(parsed.getTime())) {
+    return `${dateString} ${normalizedTime}`;
+  }
+  return noteDateFormatter.format(parsed);
+}
+
 function formatNoteDate(value) {
   if (!value) {
     return "";
@@ -114,13 +127,20 @@ function isSameDay(left, right) {
 }
 
 async function apiRequest(path, options = {}) {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers || {})
-    },
-    ...options
-  });
+  let response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.headers || {})
+      },
+      ...options
+    });
+  } catch (error) {
+    // Network errors (backend down, wrong port, blocked by browser) surface as TypeError: Failed to fetch.
+    const hint = `Could not reach the backend at ${API_BASE_URL}. Is the backend running?`;
+    throw new Error(hint);
+  }
 
   if (!response.ok) {
     let message = "Something went wrong.";
@@ -256,7 +276,11 @@ function CreateUserForm({
 
   const handleSubmit = async (event) => {
     event.preventDefault();
-    const created = await onSubmit(form);
+    const payload = { ...form };
+    if (payload.role !== "director") {
+      delete payload.password;
+    }
+    const created = await onSubmit(payload);
     if (created) {
       setForm({
         full_name: "",
@@ -307,13 +331,17 @@ function CreateUserForm({
 
         <label>
           Password
-          <input
-            type="password"
-            value={form.password}
-            onChange={(event) => setForm({ ...form, password: event.target.value })}
-            placeholder="At least 8 characters"
-            required
-          />
+          {form.role === "director" ? (
+            <input
+              type="password"
+              value={form.password}
+              onChange={(event) => setForm({ ...form, password: event.target.value })}
+              placeholder="At least 8 characters"
+              required
+            />
+          ) : (
+            <input type="text" value="Not required for residents" disabled />
+          )}
         </label>
 
         <label>
@@ -1070,6 +1098,297 @@ function CheckInsPanel({
   );
 }
 
+function FallReportsPanel({ residents, reports, loading, error, onCreateReport }) {
+  const [tab, setTab] = useState("new");
+  const [submitting, setSubmitting] = useState(false);
+  const residentsListId = "fall-report-residents";
+  const [form, setForm] = useState(() => {
+    const now = new Date();
+    return {
+      resident_id: "",
+      resident_label: "",
+      incident_date: toDateInputValue(now),
+      incident_time: now.toTimeString().slice(0, 5),
+      location: "",
+      witnessed: false,
+      injuries: "",
+      immediate_action: "",
+      ems_called: false,
+      family_notified: false,
+      notes: ""
+    };
+  });
+
+  const optionLabelForResident = (resident) => `${resident.full_name} (${resident.email})`;
+
+  useEffect(() => {
+    if (!residents?.length) {
+      return;
+    }
+    setForm((current) =>
+      current.resident_id ? current : { ...current, resident_id: String(residents[0]?.id || "") }
+    );
+  }, [residents]);
+
+  useEffect(() => {
+    if (!residents?.length) {
+      return;
+    }
+    setForm((current) => {
+      if (!current.resident_id) {
+        return current;
+      }
+      const resident = residents.find((entry) => String(entry.id) === String(current.resident_id));
+      if (!resident) {
+        return current;
+      }
+      const nextLabel = optionLabelForResident(resident);
+      return current.resident_label === nextLabel ? current : { ...current, resident_label: nextLabel };
+    });
+  }, [residents]);
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    setSubmitting(true);
+    try {
+      const created = await onCreateReport({
+        resident_id: form.resident_id ? Number(form.resident_id) : null,
+        incident_date: form.incident_date,
+        incident_time: form.incident_time,
+        location: form.location,
+        witnessed: form.witnessed,
+        injuries: form.injuries,
+        immediate_action: form.immediate_action,
+        ems_called: form.ems_called,
+        family_notified: form.family_notified,
+        notes: form.notes
+      });
+      if (created) {
+        setForm((current) => ({
+          ...current,
+          location: "",
+          witnessed: false,
+          injuries: "",
+          immediate_action: "",
+          ems_called: false,
+          family_notified: false,
+          notes: ""
+        }));
+        setTab("history");
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="drawer-stack">
+      <div className="drawer-header">
+        <p className="eyebrow">Incident Reports</p>
+        <h2>Fall report</h2>
+        <p className="lede">Document a fall, record the immediate response, and keep a searchable history.</p>
+      </div>
+
+      <div className="drawer-tabs">
+        <button
+          type="button"
+          className={`drawer-tab ${tab === "new" ? "drawer-tab--active" : ""}`}
+          onClick={() => setTab("new")}
+        >
+          New Report
+        </button>
+        <button
+          type="button"
+          className={`drawer-tab ${tab === "history" ? "drawer-tab--active" : ""}`}
+          onClick={() => setTab("history")}
+        >
+          History
+        </button>
+      </div>
+
+      {error ? <p className="error-banner">{error}</p> : null}
+      {loading ? <p className="muted-copy">Loading reports...</p> : null}
+
+      {tab === "new" ? (
+        <div className="drawer-section">
+          <form className="stack-form" onSubmit={handleSubmit}>
+            <label>
+              Resident (Optional)
+              <input
+                type="text"
+                list={residentsListId}
+                value={form.resident_label}
+                onChange={(event) => {
+                  const nextLabel = event.target.value;
+                  const match = residents.find((entry) => optionLabelForResident(entry) === nextLabel);
+                  setForm((current) => ({
+                    ...current,
+                    resident_label: nextLabel,
+                    resident_id: match ? String(match.id) : ""
+                  }));
+                }}
+                placeholder={residents.length ? "Start typing a resident name..." : "No residents available"}
+                autoComplete="off"
+              />
+              <datalist id={residentsListId}>
+                {residents.map((resident) => (
+                  <option key={resident.id} value={optionLabelForResident(resident)} />
+                ))}
+              </datalist>
+              <p className="muted-copy" style={{ marginTop: 6 }}>
+                Leave blank if the report is not tied to a specific resident.
+              </p>
+            </label>
+
+            <label>
+              Incident Date
+              <input
+                type="date"
+                value={form.incident_date}
+                onChange={(event) => setForm((current) => ({ ...current, incident_date: event.target.value }))}
+                required
+              />
+            </label>
+
+            <label>
+              Incident Time
+              <input
+                type="time"
+                value={form.incident_time}
+                onChange={(event) => setForm((current) => ({ ...current, incident_time: event.target.value }))}
+                required
+              />
+            </label>
+
+            <label>
+              Location
+              <input
+                type="text"
+                value={form.location}
+                onChange={(event) => setForm((current) => ({ ...current, location: event.target.value }))}
+                placeholder="Dining room, hallway, resident room..."
+                required
+              />
+            </label>
+
+            <div className="form-row form-row--checks">
+              <label className="checkline">
+                <input
+                  type="checkbox"
+                  checked={form.witnessed}
+                  onChange={(event) => setForm((current) => ({ ...current, witnessed: event.target.checked }))}
+                />
+                Witnessed
+              </label>
+
+              <label className="checkline">
+                <input
+                  type="checkbox"
+                  checked={form.ems_called}
+                  onChange={(event) => setForm((current) => ({ ...current, ems_called: event.target.checked }))}
+                />
+                EMS called
+              </label>
+
+              <label className="checkline">
+                <input
+                  type="checkbox"
+                  checked={form.family_notified}
+                  onChange={(event) => setForm((current) => ({ ...current, family_notified: event.target.checked }))}
+                />
+                Family notified
+              </label>
+            </div>
+
+            <label>
+              Injuries (Optional)
+              <textarea
+                rows="3"
+                value={form.injuries}
+                onChange={(event) => setForm((current) => ({ ...current, injuries: event.target.value }))}
+                placeholder="Visible bruising, complaints of pain..."
+              />
+            </label>
+
+            <label>
+              Immediate Action (Optional)
+              <textarea
+                rows="3"
+                value={form.immediate_action}
+                onChange={(event) => setForm((current) => ({ ...current, immediate_action: event.target.value }))}
+                placeholder="Assisted back to chair, vital signs taken..."
+              />
+            </label>
+
+            <label>
+              Notes (Optional)
+              <textarea
+                rows="4"
+                value={form.notes}
+                onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))}
+                placeholder="Additional context that will help with follow-up."
+              />
+            </label>
+
+            <button type="submit" className="primary-button" disabled={submitting}>
+              {submitting ? "Saving..." : "Save Report"}
+            </button>
+          </form>
+        </div>
+      ) : null}
+
+      {tab === "history" ? (
+        <div className="drawer-section">
+          {!loading && reports.length === 0 ? (
+            <div className="empty-state">
+              <h3>No reports yet</h3>
+              <p>When you save a fall report, it will appear here for quick reference.</p>
+            </div>
+          ) : null}
+
+          {reports.length > 0 ? (
+            <div className="event-list">
+              {reports.map((report) => (
+                <article key={report.id} className="event-card">
+                  <div className="event-body">
+                    <div className="event-time">
+                      <strong>Fall</strong>
+                      <span className="muted-copy">
+                        {formatIncidentDateTime(report.incident_date, report.incident_time)}
+                      </span>
+                    </div>
+                    <h4 className="event-title">{report.location}</h4>
+                    <p className="event-description">
+                      {report.resident_id ? `Resident ID: ${report.resident_id}.` : "Resident not specified."}{" "}
+                      {report.witnessed ? "Witnessed." : "Unwitnessed."} {report.ems_called ? "EMS called." : "EMS not called."}{" "}
+                      {report.family_notified ? "Family notified." : "Family not notified."}
+                    </p>
+                    {report.injuries ? (
+                      <p className="event-description">
+                        <strong>Injuries:</strong> {report.injuries}
+                      </p>
+                    ) : null}
+                    {report.immediate_action ? (
+                      <p className="event-description">
+                        <strong>Immediate action:</strong> {report.immediate_action}
+                      </p>
+                    ) : null}
+                    {report.notes ? (
+                      <p className="event-description">
+                        <strong>Notes:</strong> {report.notes}
+                      </p>
+                    ) : null}
+                  </div>
+                </article>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function SettingsPanel({ user, onUpdateProfile }) {
   const [fullName, setFullName] = useState(user.full_name || "");
   const [editing, setEditing] = useState(false);
@@ -1292,6 +1611,9 @@ function Dashboard({
   checkins,
   checkinsLoading,
   checkinsError,
+  fallReports,
+  fallReportsLoading,
+  fallReportsError,
   notes,
   notesLoading,
   notesError,
@@ -1313,6 +1635,7 @@ function Dashboard({
   onDeleteCheckIn,
   onSelectResidentForNotes,
   onCreateResidentNote,
+  onCreateFallReport,
   onOpenResidentNotesModal,
   onCloseResidentNotesModal,
   createLoading,
@@ -1384,6 +1707,9 @@ function Dashboard({
                 <button type="button" className="secondary-button" onClick={() => setDrawerView("checkins")}>
                   1:1 Check-ins
                 </button>
+                <button type="button" className="secondary-button" onClick={() => setDrawerView("fall-reports")}>
+                  Fall Reports
+                </button>
                 <button type="button" className="secondary-button" onClick={() => {
                   onOpenManageUsers();
                   setDrawerView("manage-users");
@@ -1449,6 +1775,16 @@ function Dashboard({
             />
           ) : null}
 
+          {drawerView === "fall-reports" && user.role === "director" ? (
+            <FallReportsPanel
+              residents={users.filter((entry) => entry.role === "resident")}
+              reports={fallReports}
+              loading={fallReportsLoading}
+              error={fallReportsError}
+              onCreateReport={onCreateFallReport}
+            />
+          ) : null}
+
           {drawerView === "create-user" && user.role === "director" ? (
             <div className="drawer-stack">
               <div className="drawer-header">
@@ -1493,6 +1829,9 @@ export default function App() {
   const [checkins, setCheckins] = useState([]);
   const [checkinsLoading, setCheckinsLoading] = useState(false);
   const [checkinsError, setCheckinsError] = useState("");
+  const [fallReports, setFallReports] = useState([]);
+  const [fallReportsLoading, setFallReportsLoading] = useState(false);
+  const [fallReportsError, setFallReportsError] = useState("");
   const [selectedResidentId, setSelectedResidentId] = useState(null);
   const [notes, setNotes] = useState([]);
   const [notesLoading, setNotesLoading] = useState(false);
@@ -1550,6 +1889,24 @@ export default function App() {
       setCheckinsError(error.message);
     } finally {
       setCheckinsLoading(false);
+    }
+  };
+
+  const fetchFallReports = async (currentUser) => {
+    if (!currentUser || currentUser.role !== "director") {
+      setFallReports([]);
+      return;
+    }
+
+    setFallReportsLoading(true);
+    setFallReportsError("");
+    try {
+      const data = await apiRequest(`/fall-reports?director_id=${currentUser.id}`);
+      setFallReports(data);
+    } catch (error) {
+      setFallReportsError(error.message);
+    } finally {
+      setFallReportsLoading(false);
     }
   };
 
@@ -1641,6 +1998,7 @@ export default function App() {
       if (currentUser.role === "director") {
         await fetchUsers();
         await fetchCheckIns(currentUser);
+        await fetchFallReports(currentUser);
       }
     } catch (error) {
       if (isFirebaseAuthConfigured) {
@@ -1694,6 +2052,7 @@ export default function App() {
       if (user?.role === "director") {
         await fetchUsers();
         await fetchCheckIns(user);
+        await fetchFallReports(user);
       }
       return true;
     } catch (error) {
@@ -1725,6 +2084,27 @@ export default function App() {
       return true;
     } catch (error) {
       setCheckinsError(error.message);
+      setApiError(error.message);
+      return false;
+    }
+  };
+
+  const handleCreateFallReport = async (payload) => {
+    if (!user || user.role !== "director") {
+      return false;
+    }
+
+    setApiError("");
+    setFallReportsError("");
+    try {
+      await apiRequest(`/fall-reports?director_id=${user.id}`, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      await fetchFallReports(user);
+      return true;
+    } catch (error) {
+      setFallReportsError(error.message);
       setApiError(error.message);
       return false;
     }
@@ -1832,6 +2212,7 @@ export default function App() {
     // Refresh lists where the director's name may appear.
     await fetchUsers();
     await fetchCheckIns(updated);
+    await fetchFallReports(updated);
     return updated;
   };
 
@@ -1845,6 +2226,9 @@ export default function App() {
     setCheckins([]);
     setCheckinsLoading(false);
     setCheckinsError("");
+    setFallReports([]);
+    setFallReportsLoading(false);
+    setFallReportsError("");
     setSelectedResidentId(null);
     setNotes([]);
     setNotesLoading(false);
@@ -1928,6 +2312,9 @@ export default function App() {
       checkins={checkins}
       checkinsLoading={checkinsLoading}
       checkinsError={checkinsError}
+      fallReports={fallReports}
+      fallReportsLoading={fallReportsLoading}
+      fallReportsError={fallReportsError}
       notes={notes}
       notesLoading={notesLoading}
       notesError={notesError}
@@ -1950,6 +2337,7 @@ export default function App() {
       onCreateCheckIn={handleCreateCheckIn}
       onUpdateCheckIn={handleUpdateCheckIn}
       onDeleteCheckIn={handleDeleteCheckIn}
+      onCreateFallReport={handleCreateFallReport}
       onSelectResidentForNotes={handleSelectResidentForNotes}
       onCreateResidentNote={handleCreateResidentNote}
       onOpenResidentNotesModal={handleOpenResidentNotesModal}

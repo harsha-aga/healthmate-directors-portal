@@ -37,6 +37,16 @@ def init_db() -> None:
                 name TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS directors (
+                id INTEGER PRIMARY KEY,
+                community_id INTEGER NOT NULL DEFAULT 1,
+                full_name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'director' CHECK(role IN ('director')),
+                FOREIGN KEY(community_id) REFERENCES communities(id)
+            );
+
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 community_id INTEGER NOT NULL DEFAULT 1,
@@ -129,6 +139,37 @@ def init_db() -> None:
             if "community_id" not in cols:
                 connection.execute("ALTER TABLE users ADD COLUMN community_id INTEGER NOT NULL DEFAULT 1")
                 connection.execute("UPDATE users SET community_id = 1 WHERE community_id IS NULL")
+
+        # Backfill directors table from users for existing installs.
+        try:
+            existing_dirs = connection.execute("SELECT COUNT(*) AS count FROM directors").fetchone()["count"]
+        except Exception:
+            existing_dirs = 0
+        if existing_dirs == 0:
+            try:
+                directors = connection.execute(
+                    "SELECT id, community_id, full_name, email, password, role FROM users WHERE role = 'director'"
+                ).fetchall()
+                if directors:
+                    connection.executemany(
+                        """
+                        INSERT OR IGNORE INTO directors (id, community_id, full_name, email, password, role)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                row["id"],
+                                row.get("community_id", 1) or 1,
+                                row["full_name"],
+                                row["email"],
+                                row.get("password", "") or "",
+                                "director",
+                            )
+                            for row in directors
+                        ],
+                    )
+            except Exception:
+                pass
 
         if "events" in {
             row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
