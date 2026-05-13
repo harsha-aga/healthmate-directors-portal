@@ -133,6 +133,10 @@ class AppStore(ABC):
     def create_fall_report(self, director_id: int, payload, community_id: int) -> dict:
         pass
 
+    @abstractmethod
+    def list_fall_reports_for_resident(self, resident_id: int, community_id: int) -> list[dict]:
+        pass
+
 
 class SQLiteStore(AppStore):
     def create_community(self, name: str) -> dict:
@@ -479,6 +483,9 @@ class SQLiteStore(AppStore):
 
     def create_fall_report(self, director_id: int, payload, community_id: int) -> dict:
         raise HTTPException(status_code=501, detail="Fall reports are only supported in Firestore mode.")
+
+    def list_fall_reports_for_resident(self, resident_id: int, community_id: int) -> list[dict]:
+        return []
 
 
 class FirestoreStore(AppStore):
@@ -1029,7 +1036,6 @@ class FirestoreStore(AppStore):
         reports = (
             self._collection(self.FALL_REPORTS_COLLECTION)
             .where("community_id", "==", int(community_id))
-            .where("director_id", "==", director_id)
             .stream()
         )
         results = [self._doc_to_dict(entry) for entry in reports]
@@ -1061,6 +1067,52 @@ class FirestoreStore(AppStore):
         self._collection(self.FALL_REPORTS_COLLECTION).document(str(report_id)).set(report)
         snapshot = self._collection(self.FALL_REPORTS_COLLECTION).document(str(report_id)).get()
         return self._doc_to_dict(snapshot)
+
+    def create_fall_report_from_mobile(self, reporter_id: int, payload: FallReportCreateRequest, community_id: int) -> dict:
+        """
+        Create a fall report submitted by a resident from the mobile app.
+
+        Directors see all fall reports for their community in the portal.
+        """
+        report_id = self._next_id(self.FALL_REPORTS_COLLECTION)
+        report = {
+            "id": report_id,
+            "community_id": int(community_id),
+            # 0 indicates "community-wide / not assigned to a specific director".
+            "director_id": 0,
+            "resident_id": int(reporter_id),
+            "incident_date": payload.incident_date,
+            "incident_time": payload.incident_time,
+            "location": payload.location,
+            "witnessed": bool(payload.witnessed),
+            "injuries": payload.injuries or "",
+            "immediate_action": payload.immediate_action or "",
+            "ems_called": bool(payload.ems_called),
+            "family_notified": bool(payload.family_notified),
+            "notes": payload.notes or "",
+            "created_at": self.firestore.SERVER_TIMESTAMP,
+        }
+        self._collection(self.FALL_REPORTS_COLLECTION).document(str(report_id)).set(report)
+        snapshot = self._collection(self.FALL_REPORTS_COLLECTION).document(str(report_id)).get()
+        return self._doc_to_dict(snapshot)
+
+    def list_fall_reports_for_resident(self, resident_id: int, community_id: int) -> list[dict]:
+        reports = (
+            self._collection(self.FALL_REPORTS_COLLECTION)
+            .where("community_id", "==", int(community_id))
+            .where("resident_id", "==", int(resident_id))
+            .stream()
+        )
+        results = [self._doc_to_dict(entry) for entry in reports]
+        return sorted(
+            results,
+            key=lambda entry: (
+                str(entry.get("incident_date", "")),
+                str(entry.get("incident_time", "")),
+                int(entry.get("id", 0) or 0),
+            ),
+            reverse=True,
+        )
 
 
 @lru_cache

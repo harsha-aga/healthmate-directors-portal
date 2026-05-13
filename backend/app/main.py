@@ -386,6 +386,63 @@ def mobile_portal_status(
     )
 
 
+@app.post("/mobile/fall-reports", status_code=status.HTTP_201_CREATED)
+def create_mobile_fall_report(
+    payload: FallReportCreateRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> FallReportResponse:
+    """
+    Mobile submission endpoint for fall reports.
+
+    Auth: pass Firebase ID token as `Authorization: Bearer <token>`.
+    Only allowed for Firebase users that are linked to a portal_users record.
+    The report is routed to the community's director so it appears in the portal.
+    """
+    viewer, auth_error, email, _uid = _get_user_from_bearer(authorization)
+    if not viewer:
+        if auth_error:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=auth_error)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"This Firebase account ({email or 'unknown'}) is not registered in HealthMate.",
+        )
+
+    community_id = int(viewer["community_id"])
+    directors = get_store().list_users(role="director", community_id=community_id)
+    if not directors:
+        raise HTTPException(status_code=409, detail="No director is configured for this community yet.")
+    director = min(directors, key=lambda entry: int(entry.get("id", 0) or 0))
+
+    # Always tie the report to the authenticated portal user.
+    payload.resident_id = int(viewer["id"])
+    created = get_store().create_fall_report(int(director["id"]), payload, community_id)
+    return _build_fall_report_response(created)
+
+
+@app.get("/mobile/fall-reports")
+def list_mobile_fall_reports(
+    authorization: Optional[str] = Header(default=None),
+) -> list[FallReportResponse]:
+    """
+    Mobile-friendly fall report history for the signed-in portal user.
+
+    Auth: pass Firebase ID token as `Authorization: Bearer <token>`.
+    Returns the reports submitted by this user (resident_id == portal user id).
+    """
+    viewer, auth_error, email, _uid = _get_user_from_bearer(authorization)
+    if not viewer:
+        if auth_error:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=auth_error)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"This Firebase account ({email or 'unknown'}) is not registered in HealthMate.",
+        )
+
+    community_id = int(viewer["community_id"])
+    reports = get_store().list_fall_reports_for_resident(int(viewer["id"]), community_id)
+    return [_build_fall_report_response(report) for report in reports]
+
+
 @app.get("/users")
 def list_users(director_id: int = Query(...), role: Optional[str] = Query(default=None)) -> list[UserResponse]:
     director = _get_director(director_id)
